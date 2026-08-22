@@ -1,0 +1,9 @@
+{
+  "name": "phantomscan",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "docker compose -f docker/docker-compose.yml up",
+    "build": "docker compose -f docker/docker-compose.yml up --build"
+  }
+}

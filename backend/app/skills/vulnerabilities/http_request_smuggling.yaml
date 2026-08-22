@@ -1,0 +1,84 @@
+---
+name: http_request_smuggling
+description: HTTP Request Smuggling testing covering CL.TE, TE.CL, TE.TE, and HTTP/2 downgrade variants
+category: vulnerabilities
+version: "1.0"
+tags: ["http-smuggling", "desync", "cl-te", "te-cl", "te-te", "h2", "owasp-a01"]
+applies_to: ["Nginx", "Apache", "HAProxy", "Varnish", "AWS ALB", "Cloudflare", "IIS", "Node.js", "Go", "Java", "Python"]
+severity: "HIGH"
+confidence_threshold: "LOW"
+---
+attack_surface:
+  - "Frontend proxy + backend server (different parsing)"
+  - "CDN + origin server"
+  - "Load balancer + application server"
+  - "HTTP/2 frontend → HTTP/1.1 backend"
+  - "WebSocket upgrade handling"
+  - "Chunked encoding handling"
+
+detection_channels:
+  - "CL.TE: Content-Length + Transfer-Encoding: chunked"
+  - "TE.CL: Transfer-Encoding + Content-Length (frontend ignores TE)"
+  - "TE.TE: Both headers, different parsing"
+  - "HTTP/2 downgrade: Header smuggling via pseudo-headers"
+  - "Response queue poisoning: Cache poisoning, session hijacking"
+  - "Request tunneling: Bypass auth, access internal endpoints"
+  - "Blind: Timing differences, error rates"
+
+payload_primitives:
+  cl_te:
+    - "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 13\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nSMUGGLED"
+  te_cl:
+    - "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nSMUGGLED\r\n0\r\n\r\n"
+  te_te:
+    - "POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: x\r\n\r\n0\r\n\r\nSMUGGLED"
+  h2_downgrade:
+    - ":method: POST\n:path: /\n:authority: example.com\ncontent-length: 13\ntransfer-encoding: chunked\n\n0\r\n\r\nSMUGGLED"
+  obfuscation:
+    - "Transfer-Encoding: chunked\r\nTransfer-encoding: identity"
+    - "Content-Length: 13\r\nContent-length: 0"
+    - "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked"
+  desync:
+    - "Multiple requests in single connection to detect desync"
+
+false_positive_validation:
+  - "Confirm desync via differential responses"
+  - "Test with multiple payloads (CL.TE, TE.CL, TE.TE)"
+  - "Verify not false positive from connection reuse"
+  - "Check for WAF/IPS blocking (may break smuggling)"
+  - "Validate with automated tools (smuggler, HTTP Request Smuggler)"
+  - "Confirm impact: cache poisoning, auth bypass, request tunneling"
+
+chaining_guidance:
+  - "Request Smuggling + Cache Poisoning → Stored XSS, defacement"
+  - "Request Smuggling + Auth Bypass → Session hijacking"
+  - "Request Smuggling + Internal Endpoint → SSRF, admin access"
+  - "HTTP/2 Downgrade + H2.CL/TE → Bypass frontend controls"
+  - "WebSocket Smuggling → Connection hijacking"
+
+remediation_patterns:
+  - "Use same HTTP parser frontend and backend"
+  - "Disable HTTP/1.1 on backend, use HTTP/2 only"
+  - "Normalize headers: reject ambiguous requests"
+  - "Use 'Connection: close' on backend responses"
+  - "Implement request validation at edge"
+  - "Monitor for desync anomalies (response mismatches)"
+  - "Upgrade to HTTP/2 end-to-end"
+
+code_locations:
+  - "Search for reverse proxy configs:"
+  - "  Nginx: proxy_pass, proxy_http_version"
+  - "  Apache: ProxyPass, ProxyPassReverse"
+  - "  HAProxy: backend servers, http-reuse"
+  - "Find backend server parsing:"
+  - "  Node.js: http.createServer, express"
+  - "  Go: http.Server, gin, echo"
+  - "  Java: Tomcat, Jetty, Undertow"
+  - "  Python: gunicorn, uvicorn, Flask, Django"
+  - "Check HTTP/2 configuration: h2, h2c"
+
+references:
+  - "https://portswigger.net/web-security/request-smuggling"
+  - "https://github.com/anshumanbh/http-request-smuggling"
+  - "https://blog.netspi.com/http-request-smuggling/"
+  - "https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Request_Smuggling_Cheat_Sheet.html"

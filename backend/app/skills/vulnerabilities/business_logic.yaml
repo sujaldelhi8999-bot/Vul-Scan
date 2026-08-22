@@ -1,0 +1,95 @@
+---
+name: business_logic
+description: Business logic flaw testing covering workflow bypass, state manipulation, and authorization gaps
+category: vulnerabilities
+version: "1.0"
+tags: ["business-logic", "workflow", "authorization", "owasp-a01", "owasp-a04"]
+applies_to: ["E-commerce", "SaaS", "FinTech", "Healthcare", "Booking", "Marketplace", "Multi-step Forms"]
+severity: "MEDIUM"
+confidence_threshold: "LOW"
+---
+attack_surface:
+  - "Multi-step checkout flows (cart → shipping → payment → confirm)"
+  - "Account recovery workflows (email → token → reset)"
+  - "Subscription management (upgrade/downgrade/cancel)"
+  - "Referral/affiliate programs"
+  - "Loyalty points / reward redemption"
+  - "Gift card / voucher systems"
+  - "User onboarding / KYC flows"
+  - "Admin approval workflows"
+  - "Document signing / approval chains"
+
+detection_channels:
+  - "Step skipping: Jump directly to final step"
+  - "Parameter manipulation: Change price, quantity, user_id"
+  - "State reversal: Cancel after confirmation, revert approved state"
+  - "Replay attacks: Reuse tokens, codes, confirmations"
+  - "Race conditions: Concurrent state transitions"
+  - "Authorization bypass: Access steps without prerequisites"
+  - "Negative testing: Invalid transitions accepted"
+
+payload_primitives:
+  step_skipping:
+    - "POST /checkout/confirm without /checkout/shipping"
+    - "Direct API call to final endpoint"
+    - "Manipulate step parameter: ?step=4"
+  parameter_tampering:
+    - "price: 0, -1, 0.01"
+    - "quantity: 999, -1"
+    - "user_id: other_user_id"
+    - "currency: USD → JPY (rate manipulation)"
+  state_manipulation:
+    - "Cancel order after payment confirmed"
+    - "Reuse single-use token/code"
+    - "Modify webhook payloads"
+  workflow_bypass:
+    - "Skip email verification"
+    - "Bypass 2FA enrollment"
+    - "Skip terms acceptance"
+  coupon_abuse:
+    - "Apply multiple coupons (stacking)"
+    - "Reuse single-use coupon"
+    - "Manipulate coupon code: COUPON123 → COUPON124"
+  referral_gaming:
+    - "Self-referral (create accounts, refer self)"
+    - "Automated referral farming"
+    - "Manipulate referral tracking params"
+
+false_positive_validation:
+  - "Verify business impact (financial loss, unauthorized access)"
+  - "Confirm not intended behavior (feature, not bug)"
+  - "Test in production-like environment (not sandbox)"
+  - "Validate end-to-end flow completes successfully"
+  - "Check for compensating controls (audit, reconciliation)"
+  - "Confirm reproducible with realistic user behavior"
+
+chaining_guidance:
+  - "Business Logic + Race Condition → Double coupon, double reward"
+  - "Business Logic + IDOR → Other users' workflow manipulation"
+  - "Business Logic + Auth Bypass → Admin workflow access"
+  - "Business Logic + Parameter Tampering → Price manipulation"
+  - "Workflow Bypass + Session Fixation → Account takeover"
+
+remediation_patterns:
+  - "Server-side state machines: Validate current state before transition"
+  - "Immutable audit logs for all state changes"
+  - "Idempotency keys for all mutations"
+  - "Price/quantity validated server-side from catalog"
+  - "Single-use tokens with atomic consumption"
+  - "Step sequence enforcement (session-based or token-based)"
+  - "Rate limiting on sensitive workflows"
+  - "Business rule engine (Drools, Easy Rules) for complex logic"
+
+code_locations:
+  - "Search for state transition logic:"
+  - "  `if order.status == 'pending': order.status = 'confirmed'`"
+  - "  `workflow.next_step()` without validation"
+  - "Find hardcoded prices: `price = 9.99` instead of catalog lookup"
+  - "Look for missing step validation: `@app.post('/step3')` without step2 check"
+  - "Identify coupon application without usage tracking"
+  - "Check for client-side only validation"
+
+references:
+  - "https://owasp.org/www-project-top-ten/2017/A4_Insecure_Deserialization"
+  - "https://portswigger.net/web-security/logic-flaws"
+  - "https://github.com/OWASP/CheatSheetSeries/blob/master/cheatsheets/Business_Logic_Cheat_Sheet.md"

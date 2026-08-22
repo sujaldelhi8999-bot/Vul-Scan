@@ -1,0 +1,84 @@
+---
+name: race_conditions
+description: Race condition testing covering TOCTOU, limit bypass, and concurrent state manipulation
+category: vulnerabilities
+version: "1.0"
+tags: ["race-condition", "concurrency", "toctou", "business-logic", "owasp-a01"]
+applies_to: ["E-commerce", "Banking", "Gaming", "Booking Systems", "Concurrent APIs", "Node.js", "Java", "Go", "Python"]
+severity: "HIGH"
+confidence_threshold: "LOW"
+---
+attack_surface:
+  - "Financial transactions (transfers, withdrawals, deposits)"
+  - "Coupon/voucher redemption (single-use codes)"
+  - "Inventory management (stock decrement, reservation)"
+  - "Voting/rating systems (duplicate votes)"
+  - "File upload (duplicate processing)"
+  - "Account registration (username uniqueness)"
+  - "Password reset (token reuse)"
+  - "API rate limiting (token bucket bypass)"
+  - "Gaming (loot boxes, reward claims)"
+
+detection_channels:
+  - "TOCTOU: Check-then-act with state change between check and act"
+  - "Limit bypass: Exceed single-use/quantity limits"
+  - "State corruption: Inconsistent state after concurrent ops"
+  - "Duplicate processing: Same operation applied multiple times"
+  - "Negative balance: Withdrawal exceeds balance via concurrency"
+
+payload_primitives:
+  concurrent_requests:
+    - "Send 10-100 identical requests simultaneously"
+    - "Use multiple threads/processes/async tasks"
+    - "Vary timing: simultaneous, staggered (ms), burst"
+  parameter_variation:
+    - "Same resource, different parameters"
+    - "Different resources, same user session"
+  session_manipulation:
+    - "Same session, multiple tabs"
+    - "Different sessions, same user"
+  http_methods:
+    - "POST + POST (duplicate submission)"
+    - "GET + POST (check via GET, act via POST)"
+    - "PUT + DELETE (state transition)"
+
+false_positive_validation:
+  - "Verify actual state change (database, filesystem, external API)"
+  - "Confirm not idempotent (retry logic, deduplication)"
+  - "Check for eventual consistency (delayed reconciliation)"
+  - "Validate business impact (financial loss, inventory discrepancy)"
+  - "Test with realistic concurrency levels (not just synthetic)"
+  - "Confirm fix: serialization, locks, optimistic locking, idempotency keys"
+
+chaining_guidance:
+  - "Race Condition + Coupon Abuse → Free products/unlimited discounts"
+  - "Race Condition + Wallet/Transfer → Double-spend, negative balance"
+  - "Race Condition + File Upload → Overwrite, duplicate processing"
+  - "Race Condition + Rate Limit → Unlimited API calls"
+  - "Race Condition + Password Reset → Token reuse, account takeover"
+  - "TOCTOU + Symlink → Privilege escalation (file race)"
+
+remediation_patterns:
+  - "Database-level: Row-level locks (SELECT FOR UPDATE), serializable isolation"
+  - "Application-level: Distributed locks (Redis Redlock, etcd)"
+  - "Optimistic locking: Version/timestamp columns, CAS operations"
+  - "Idempotency keys: Client-generated unique keys for all mutations"
+  - "Atomic operations: Single SQL statement, Redis Lua scripts"
+  - "Queue-based: Serialize via message queue (Kafka, RabbitMQ)"
+  - "Rate limiting: Per-resource, not just per-user"
+
+code_locations:
+  - "Search for check-then-act patterns:"
+  - "  `if balance >= amount: balance -= amount`"
+  - "  `if coupon.valid: coupon.use()`"
+  - "  `if not exists: create()`"
+  - "Look for non-atomic increments: `counter += 1`, `stock -= qty`"
+  - "Find missing idempotency keys on POST/PUT/DELETE"
+  - "Check for SELECT then UPDATE without FOR UPDATE"
+  - "Identify file operations: check exists → write"
+
+references:
+  - "https://owasp.org/www-project-top-ten/2017/A1_Broken_Access_Control"
+  - "https://portswigger.net/web-security/race-conditions"
+  - "https://github.com/DefectDojo/django-DefectDojo/wiki/Race-Conditions"
+  - "https://blog.twitter.com/engineering/en_us/a/2019/race-conditions-in-web-applications"

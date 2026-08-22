@@ -1,0 +1,41 @@
+# Dependency Review Configuration
+# Used by actions/dependency-review-action
+
+# Fail on these severity levels
+fail-on-severity: high
+
+# Allow these licenses (deny all others)
+allow-licenses:
+  - MIT
+  - Apache-2.0
+  - BSD-2-Clause
+  - BSD-3-Clause
+  - ISC
+  - Python-2.0
+  - MPL-2.0
+  - LGPL-2.1-only
+  - LGPL-3.0-only
+
+# Deny these specific packages (known malicious or problematic)
+deny-packages:
+  - event-stream
+  - flatmap-stream
+  - ua-parser-js
+  - coa
+  - rc
+  - tough-cookie
+  - @babel/traverse
+  - electron-native-notify
+  - @vue/cli-service
+
+# Allow these scopes
+allow-scopes:
+  - phantomscan
+  - github
+  - actions
+
+# Minimum coverage for new dependencies
+min-coverage: 80
+
+# Require SBOM for new dependencies
+require-sbom: true

@@ -1,0 +1,80 @@
+---
+name: idor
+description: Insecure Direct Object Reference testing for horizontal and vertical privilege escalation
+category: vulnerabilities
+version: "1.0"
+tags: ["idor", "access-control", "bolA", "authorization", "owasp-a01"]
+applies_to: ["REST APIs", "GraphQL", "Web Applications", "Mobile APIs"]
+severity: "HIGH"
+confidence_threshold: "MEDIUM"
+---
+attack_surface:
+  - "Numeric IDs in URLs: /api/users/123, /orders/456"
+  - "UUID/GUID references: /api/documents/550e8400-e29b"
+  - "Filename/path parameters: /download?file=report.pdf"
+  - "Database keys in hidden form fields"
+  - "GraphQL node IDs: node(id: \"VXNlcjoxMjM=\")"
+  - "WebSocket message IDs"
+  - "Export/download endpoints with object references"
+
+detection_channels:
+  - "Horizontal: Access other users' resources at same privilege level"
+  - "Vertical: Access higher-privilege resources (admin, manager)"
+  - "Cross-tenant: Access other organization's data in multi-tenant apps"
+  - "State-changing: Modify/delete other users' data"
+  - "Mass assignment: Overwrite protected fields via IDOR"
+
+payload_primitives:
+  numeric_enumeration:
+    - "1, 2, 3, 4, 5... (sequential)"
+    - "100, 101, 102... (offset)"
+    - "999999, 999998... (reverse)"
+  uuid_enumeration:
+    - "Sequential UUIDs (v1 time-based)"
+    - "Predictable UUID patterns"
+  path_traversal:
+    - "../other-user/file.txt"
+    - "..%2F..%2Fother-user%2Ffile.txt"
+  parameter_pollution:
+    - "?id=123&id=456"
+    - "?user_id=123&user_id=456"
+  graphql:
+    - "query { user(id: 123) { email } }"
+    - "query { node(id: \"VXNlcjoxMjM=\") { ... on User { email } } }"
+
+false_positive_validation:
+  - "Confirm accessed data belongs to different user/tenant"
+  - "Verify response contains sensitive data (email, PII, financial)"
+  - "Check for authorization headers/session still valid"
+  - "Test state-changing operations (PUT, DELETE, POST)"
+  - "Validate not a public resource (public profiles, published content)"
+  - "Confirm consistent access across multiple requests"
+
+chaining_guidance:
+  - "IDOR + Info Disclosure → PII theft → Identity theft"
+  - "IDOR + Mass Assignment → Privilege escalation (role=admin)"
+  - "IDOR + File Upload → Overwrite other users' files"
+  - "IDOR + Business Logic → Order manipulation, coupon abuse"
+  - "GraphQL IDOR + Introspection → Full schema traversal"
+  - "BOLA + WebSocket → Real-time unauthorized data access"
+
+remediation_patterns:
+  - "Implement object-level authorization checks (policy engines: OPA, Casbin)"
+  - "Use indirect object references (random tokens, capability URLs)"
+  - "Validate ownership: `resource.user_id == current_user.id`"
+  - "Implement RBAC/ABAC with resource-specific permissions"
+  - "Use UUIDs instead of sequential IDs (but still validate ownership)"
+  - "Add audit logging for all object access"
+  - "Implement rate limiting on object enumeration endpoints"
+
+code_locations:
+  - "Search for direct ID usage: `User.find(params[:id])`, `User.objects.get(id=id)`"
+  - "Look for missing authorization: `@app.get('/api/users/{user_id}')` without check"
+  - "Check GraphQL resolvers without ownership validation"
+  - "Find ORM queries without user scoping: `Order.query.filter_by(id=order_id).first()`"
+  - "Identify file access without ownership check: `send_file(user_file.path)`"
+
+references:
+  - "https://owasp.org/www-project-top-ten/2017/A5_Broken_Access_Control"
+  - "https://portswigger.net/web-security/access-control/idor"
+  - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/IDOR"

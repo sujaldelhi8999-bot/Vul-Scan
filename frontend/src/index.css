@@ -1,0 +1,184 @@
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800&family=Geist+Mono:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  font-family: Geist, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+
+  --app-canvas: #F8FAFC;
+  --app-canvas-alt: #F1F5F9;
+  --sidebar-canvas: #FFFFFF;
+  --topbar-canvas: rgba(255, 255, 255, 0.85);
+
+  --surface-primary: #FFFFFF;
+  --surface-secondary: #F8FAFC;
+  --surface-tertiary: #F1F5F9;
+  --surface-selected: #EFF6FF;
+  --surface-hover: #F1F5F9;
+
+  --text-strong: #0F172A;
+  --text-default: #334155;
+  --text-muted: #475569;
+  --text-subtle: #64748B;
+
+  --border-light: #E2E8F0;
+  --border-default: #CBD5E1;
+  --border-strong: #94A3B8;
+
+  --brand: #2563EB;
+  --brand-hover: #1D4ED8;
+  --brand-soft: #EFF6FF;
+
+  --success: #059669;
+  --success-soft: #ECFDF5;
+  --success-border: #A7F3D0;
+
+  --warning: #D97706;
+  --warning-soft: #FEF3C7;
+  --warning-border: #FDE68A;
+
+  --danger: #DC2626;
+  --danger-soft: #FEF2F2;
+  --danger-border: #FCA5A5;
+
+  --info: #2563EB;
+  --info-soft: #EFF6FF;
+  --info-border: #BFDBFE;
+
+  --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-float: 0 6px 20px rgba(15, 23, 42, 0.08);
+  --shadow-drawer: -3px 0 16px rgba(15, 23, 42, 0.06);
+
+  --radius-control: 6px;
+  --radius-panel: 10px;
+  --radius-drawer: 0;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: var(--app-canvas);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--app-canvas);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--text-default);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: var(--text-strong); }
+h2 { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; color: var(--text-strong); }
+h3 { font-size: 12px; font-weight: 600; color: var(--text-strong); }
+
+*, *::before, *::after {
+  border-color: var(--border-light);
+}
+
+button, input, select, textarea {
+  font: inherit;
+  font-size: 13px;
+}
+
+button, label {
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  color: #FFFFFF;
+  background: rgba(37, 99, 235, 0.25);
+}
+
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #E2E8F0;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #CBD5E1;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 1px;
+}
+
+@layer utilities {
+  .scrollbar-compact {
+    scrollbar-width: thin;
+    scrollbar-color: #CDD5DF transparent;
+  }
+}
+
+@layer base {
+  :root {
+    /* backward-compatible aliases for old code */
+    --bg-app: var(--app-canvas);
+    --bg-sidebar: var(--sidebar-canvas);
+    --bg-topbar: var(--topbar-canvas);
+    --bg-surface: var(--surface-primary);
+    --bg-surface-soft: var(--surface-secondary);
+    --bg-inset: var(--surface-tertiary);
+    --bg-hover: var(--surface-hover);
+    --bg-selected: var(--surface-selected);
+    --text-primary: var(--text-strong);
+    --text-secondary: var(--text-default);
+    --text-muted: var(--text-muted, #667085);
+    --text-disabled: var(--text-subtle);
+    --accent: var(--brand);
+    --accent-hover: var(--brand-hover);
+    --accent-subtle: var(--brand-soft);
+    --accent-muted: var(--brand-soft);
+    --border-subtle: var(--border-light);
+    --border-active: var(--brand);
+    --border-focus: var(--brand);
+    --error: var(--danger);
+    --error-subtle: var(--danger-soft);
+    --error-border: var(--danger-border);
+    --success-subtle: var(--success-soft);
+    --warning-subtle: var(--warning-soft);
+    --warning-border: var(--warning-border, #F2D59C);
+    --info-subtle: var(--info-soft);
+    --info-border: var(--info-border, #C9DDF8);
+    --shadow-xs: var(--shadow-card);
+    --shadow-sm: var(--shadow-card);
+    --shadow-md: var(--shadow-float);
+    --shadow-lg: var(--shadow-float);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@layer utilities {
+  .card-bright {
+    @apply bg-white rounded-xl shadow-sm border border-gray-200 p-6;
+  }
+  .card-bright .title {
+    @apply text-lg font-semibold text-gray-900 mb-4;
+  }
+}

