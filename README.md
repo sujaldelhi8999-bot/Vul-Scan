@@ -12,8 +12,8 @@ Built for **authorized security testing** on targets you own, the PhantomBank La
 
 ```bash
 git clone https://github.com/sujaldelhi8999-bot/Vul-Scan.git
-cd phantomscan
-cp backend/.env.example backend/.env
+cd Vul-Scan
+cd backend/.env.example backend/.env
 # Edit backend/.env with your API keys (see Configuration below)
 docker-compose -f docker/docker-compose.yml up --build
 ```
@@ -49,7 +49,7 @@ npm run dev
 ## 🏗️ Project Structure
 
 ```
-phantomscan/
+Vul-Scan/
 ├── backend/
 │   ├── app/
 │   │   ├── agents/            # Security agents (orchestrator, scanner, recon, analyzer...)
