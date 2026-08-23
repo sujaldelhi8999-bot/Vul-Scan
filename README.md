@@ -11,7 +11,7 @@ Built for **authorized security testing** on targets you own, the PhantomBank La
 ### Option 1: Docker Compose (Recommended)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/sujaldelhi8999-bot/Vul-Scan.git
 cd phantomscan
 cp backend/.env.example backend/.env
 # Edit backend/.env with your API keys (see Configuration below)
