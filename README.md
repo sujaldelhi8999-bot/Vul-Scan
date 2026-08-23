@@ -13,7 +13,7 @@ Built for **authorized security testing** on targets you own, the PhantomBank La
 ```bash
 git clone https://github.com/sujaldelhi8999-bot/Vul-Scan.git
 cd Vul-Scan
-cd backend/.env.example backend/.env
+cp backend/.env.example backend/.env
 # Edit backend/.env with your API keys (see Configuration below)
 docker-compose -f docker/docker-compose.yml up --build
 ```
