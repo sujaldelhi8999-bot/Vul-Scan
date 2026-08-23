@@ -16,6 +16,7 @@ from app.database import (
 )
 from app.services.active_gate import canonicalize_hostname
 from app.services.authorization import TargetValidationError, canonicalize_target
+from app.services.enterprise_access import has_product_admin_access
 
 logger = logging.getLogger("phantomscan.admin_scope")
 
@@ -49,10 +50,10 @@ class ScopeRemoveResponse(BaseModel):
 
 
 async def _require_admin(current_user: dict = Depends(get_current_user)) -> dict:
-    if current_user.get("role") != "admin":
+    if not has_product_admin_access(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail={"code": "ADMIN_REQUIRED", "message": "Admin privileges are required for this operation."},
+            detail={"code": "ADMIN_REQUIRED", "message": "Admin or enterprise owner privileges are required for this operation."},
         )
     return current_user
 

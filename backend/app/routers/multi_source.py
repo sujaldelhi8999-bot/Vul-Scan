@@ -12,10 +12,11 @@ import tempfile
 import time
 import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 
 from app.auth_middleware import get_current_user
 from app.agents.orchestrator import OrchestratorAgent
@@ -28,6 +29,7 @@ from app.database import (
     list_multi_source_scans,
     list_scan_sources,
     list_source_correlations,
+    update_scan_source_status,
     update_scan_status,
 )
 from app.models import (
@@ -52,6 +54,21 @@ settings = get_settings()
 authorization_service = TargetAuthorizationService()
 scan_policy = ScanPolicy(authorization_service)
 logger = logging.getLogger("phantomscan.multi_source")
+
+_DEFAULT_LOCAL_EXCLUDES = [
+    ".git/**",
+    "node_modules/**",
+    "vendor/**",
+    "dist/**",
+    "build/**",
+    ".next/**",
+    ".nuxt/**",
+    "coverage/**",
+    "__pycache__/**",
+    ".venv/**",
+    "venv/**",
+    "*.min.js",
+]
 
 
 _SCAN_STATUS_VALUES = {"queued", "running", "cancelling", "cancelled", "complete", "error", "failed"}
@@ -99,6 +116,7 @@ async def build_response(scan_id: int, user: dict[str, Any] | None = None) -> Mu
     scan = await get_scan(scan_id)
     if not scan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+    scan = await _mark_scan_timed_out_if_needed(scan)
     sources = await _fetch_sources(scan_id)
     findings = await _fetch_findings(scan_id, user)
     correlations = await _fetch_correlations(scan_id)
@@ -135,6 +153,7 @@ async def build_response(scan_id: int, user: dict[str, Any] | None = None) -> Mu
         overall_status=_map_source_status(scan.get("status")),
         overall_progress=int(scan.get("progress") or 0),
         sources=source_results,
+        findings=findings,
         total_findings=len(findings),
         findings_by_severity=severity_totals,
         correlated_findings_count=len(correlations),
@@ -147,6 +166,42 @@ async def build_response(scan_id: int, user: dict[str, Any] | None = None) -> Mu
         pdf_report_url=None,
         health_score=scan.get("health_score"),
     )
+
+
+def _parse_scan_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00").replace(" ", "T")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def _scan_exceeded_duration(scan: dict[str, Any]) -> bool:
+    if str(scan.get("status") or "").lower() not in {"queued", "running", "cancelling"}:
+        return False
+    started_at = _parse_scan_timestamp(scan.get("started_at"))
+    if not started_at:
+        return False
+    max_minutes = int(scan.get("max_duration_minutes") or 120)
+    elapsed_seconds = (datetime.utcnow() - started_at).total_seconds()
+    return elapsed_seconds > max_minutes * 60
+
+
+async def _mark_scan_timed_out_if_needed(scan: dict[str, Any]) -> dict[str, Any]:
+    if not _scan_exceeded_duration(scan):
+        return scan
+    scan_id = int(scan["id"])
+    await update_scan_status(scan_id, "error", "Scan exceeded the configured duration limit")
+    for source in await _fetch_sources(scan_id):
+        if str(source.get("status") or "").lower() in {"pending", "queued", "running"}:
+            await update_scan_source_status(
+                scan_id,
+                str(source.get("source_type")),
+                "failed",
+                error_message="Scan exceeded the configured duration limit",
+            )
+    return await get_scan(scan_id) or scan
 
 
 async def _validate_local_sources(request: MultiSourceScanRequest) -> None:
@@ -164,6 +219,18 @@ async def _validate_local_sources(request: MultiSourceScanRequest) -> None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Path is neither a directory nor a file: {path}")
         if not os.access(normalized, os.R_OK):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Path is not readable: {path}")
+
+
+def _with_default_local_excludes(request: MultiSourceScanRequest) -> MultiSourceScanRequest:
+    sources: list[Any] = []
+    changed = False
+    for source in request.sources:
+        if getattr(source, "type", None) == "local" and not getattr(source, "exclude_patterns", None):
+            sources.append(source.model_copy(update={"exclude_patterns": _DEFAULT_LOCAL_EXCLUDES}))
+            changed = True
+        else:
+            sources.append(source)
+    return request.model_copy(update={"sources": sources}) if changed else request
 
 
 _GITHUB_URL_RE = __import__("re").compile(
@@ -272,6 +339,7 @@ async def start_multi_source_scan(
     if cloned_paths:
         request = request.model_copy(update={"sources": sources})
 
+    request = _with_default_local_excludes(request)
     await _validate_local_sources(request)
     return await _start_scan(request, user)
 
@@ -337,16 +405,24 @@ async def _submit(request: MultiSourceScanRequest, scan_id: int, user_id: str, u
 
     reservation = await scan_job_manager.reserve_slot()
 
-    task = loop.create_task(
-        OrchestratorAgent(limits=scan_job_manager.limits).run_multi_source(
-            request,
-            scan_id,
-            user_id=user_id,
-            user_role=user_role,
-            authorization_context={},
-        ),
-        name=f"phantomscan-multi-{scan_id}",
-    )
+    async def _run_with_timeout() -> dict[str, Any]:
+        try:
+            return await asyncio.wait_for(
+                OrchestratorAgent(limits=scan_job_manager.limits).run_multi_source(
+                    request,
+                    scan_id,
+                    user_id=user_id,
+                    user_role=user_role,
+                    authorization_context={},
+                ),
+                timeout=max(60, int(request.max_duration_minutes or 120) * 60 + 5),
+            )
+        except asyncio.TimeoutError:
+            await update_scan_status(scan_id, "error", "Scan exceeded the configured duration limit")
+            await add_audit_log(scan_id, "Job Manager", "scan_timeout", "Local code analysis terminated by the configured duration limit", user_id=user_id)
+            return {"scan_id": scan_id, "status": "error", "error": "Scan time limit exceeded"}
+
+    task = loop.create_task(_run_with_timeout(), name=f"phantomscan-multi-{scan_id}")
 
     def _release_slot_on_done(t: asyncio.Task) -> None:
         asyncio.ensure_future(scan_job_manager.release_slot(reservation))
@@ -360,6 +436,7 @@ async def multi_source_history(user: dict = Depends(get_current_user)) -> list[M
     rows = await list_multi_source_scans(user["id"], enterprise_id=enterprise_id_for(user))
     items: list[MultiSourceScanHistoryItem] = []
     for row in rows:
+        row = await _mark_scan_timed_out_if_needed(row)
         sources = await _fetch_sources(int(row["id"]))
         findings = await _fetch_findings(int(row["id"]), user)
         correlations = await _fetch_correlations(int(row["id"]))
@@ -459,7 +536,7 @@ async def stop_multi_source_scan(
 _MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
 
 
-async def _process_uploaded_codebase(scan_id: int, temp_zip_path: Path, work_dir: Path, user_id: str, max_duration_minutes: int) -> None:
+async def _process_uploaded_codebase(scan_id: int, temp_zip_path: Path, work_dir: Path, user_id: str, user_role: str, max_duration_minutes: int) -> None:
     """Background task: extract zip then submit scan using the existing scan_id.
 
     Follows the VULSCAN approach: one scan record, files stay on disk until
@@ -476,7 +553,7 @@ async def _process_uploaded_codebase(scan_id: int, temp_zip_path: Path, work_dir
             name=f"Uploaded codebase: {os.path.basename(scan_root.rstrip(os.sep)) or 'zip'}",
             mode="multi_agent",
             intensity="medium",
-            sources=[LocalCodebaseConfig(path=scan_root)],
+            sources=[LocalCodebaseConfig(path=scan_root, exclude_patterns=_DEFAULT_LOCAL_EXCLUDES)],
             max_duration_minutes=max_duration_minutes,
         )
         await _validate_local_sources(request)
@@ -492,7 +569,7 @@ async def _process_uploaded_codebase(scan_id: int, temp_zip_path: Path, work_dir
             user_id=user_id,
             target="multi-source://scan",
         )
-        await _submit(request, scan_id, user_id, "user")
+        await _submit(request, scan_id, user_id, user_role)
     except Exception as exc:
         logger.exception("Failed to process uploaded codebase for scan %d", scan_id)
         await update_scan_status(scan_id, "error", str(exc)[:1000])
@@ -500,7 +577,6 @@ async def _process_uploaded_codebase(scan_id: int, temp_zip_path: Path, work_dir
 
 @router.post("/upload-codebase")
 async def upload_codebase(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     max_duration_minutes: int = Form(120, ge=5, le=1440),
     approval_request_id: int | None = Form(None),
@@ -546,8 +622,30 @@ async def upload_codebase(
         target="multi-source://scan",
     )
 
-    # Process extraction and scan in background
-    background_tasks.add_task(_process_uploaded_codebase, scan_id, temp_zip_path, work_dir, user["id"], max_duration_minutes)
+    # Process extraction and scan on the running event loop. This matches the
+    # GitHub analysis flow: the HTTP request returns immediately while the scan
+    # task keeps updating the same scan record for polling/details pages.
+    task = asyncio.create_task(
+        _process_uploaded_codebase(
+            scan_id,
+            temp_zip_path,
+            work_dir,
+            user["id"],
+            user.get("role", "user"),
+            max_duration_minutes,
+        ),
+        name=f"phantomscan-upload-{scan_id}",
+    )
+
+    def _log_upload_task_done(done: asyncio.Task) -> None:
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            logger.warning("Uploaded codebase processing was cancelled for scan %d", scan_id)
+        except Exception:
+            logger.exception("Uploaded codebase processing failed for scan %d", scan_id)
+
+    task.add_done_callback(_log_upload_task_done)
 
     return {
         "scan_id": scan_id,

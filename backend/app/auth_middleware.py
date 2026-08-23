@@ -70,7 +70,7 @@ async def get_current_user(authorization: Annotated[str | None, Header()] = None
                 "max_severity": "ALL",
                 "can_request_audit": True,
                 "can_request_fix": True,
-                "can_approve": True,
+                "can_approve": membership["enterprise_role"] == "owner",
                 "can_manage_members": membership["enterprise_role"] == "owner",
                 "allowed_email_domains": membership.get("allowed_email_domains", []),
                 "enterprise_membership_active": bool(membership.get("membership_active", 1)),
@@ -83,7 +83,7 @@ def require_tier(required_tier: str):
     tier_order = {"FREE": 0, "PRO": 1, "ENTERPRISE": 2}
 
     async def dependency(user: dict = Depends(get_current_user)) -> dict:
-        if user.get("role") == "admin":
+        if is_platform_admin(user):
             return user
         user_tier = user.get("subscription_tier", "FREE")
         if tier_order.get(user_tier, 0) < tier_order.get(required_tier, 0):
@@ -100,7 +100,7 @@ def require_admin(user: dict = Depends(get_current_user)) -> dict:
     if not has_product_admin_access(user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin privileges required",
+            detail="Admin or enterprise owner privileges required",
         )
     return user
 

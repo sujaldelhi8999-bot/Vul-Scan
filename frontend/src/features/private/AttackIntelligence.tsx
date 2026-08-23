@@ -12,6 +12,7 @@ import toast from 'react-hot-toast';
 
 import { useAuth } from '../../context/AuthContext';
 import apiClient, { apiErrorMessage } from '../../services/api';
+import { hasElevatedAccess } from '../../utils/access';
 import {
   Button,
   EmptyState,
@@ -232,7 +233,7 @@ export default function AttackIntelligence() {
     }
   };
 
-  if (!user || (user.role !== 'admin' && !user.enterpriseId)) {
+  if (!hasElevatedAccess(user)) {
     return (
       <Page>
         <PageHeader title="Attack Intelligence" description="Admin-only feature" />
@@ -241,7 +242,7 @@ export default function AttackIntelligence() {
             <Lock className="h-5 w-5 text-red-500" />
             <div>
               <p className="text-sm font-semibold text-red-600 dark:text-red-400">Admin access required</p>
-              <p className="text-xs text-[var(--text-muted)]">Log in as admin to access Attack Intelligence.</p>
+              <p className="text-xs text-[var(--text-muted)]">Log in as admin or enterprise owner to access Attack Intelligence.</p>
             </div>
           </div>
         </Panel>

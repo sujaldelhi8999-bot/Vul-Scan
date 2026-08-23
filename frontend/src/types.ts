@@ -96,6 +96,13 @@ export interface Finding {
   exploitation_result?: ExploitationResult | null;
 }
 
+export interface FindingsPageResponse {
+  items: Finding[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export interface ExploitationResultRow {
   cells?: string[];
   text?: string;
@@ -377,6 +384,7 @@ export interface MultiSourceScanResponse {
   overall_status: string;
   overall_progress: number;
   sources: MultiSourceSourceResult[];
+  findings: Finding[];
   total_findings: number;
   findings_by_severity: Record<string, number>;
   correlated_findings_count: number;
@@ -662,6 +670,9 @@ export interface ScanHistoryItem {
   progress: number;
   created_at: string;
   completed_at: string | null;
+  findings_count?: number;
+  critical_findings_count?: number;
+  high_findings_count?: number;
 }
 
 export interface ScanArtifactsResponse {

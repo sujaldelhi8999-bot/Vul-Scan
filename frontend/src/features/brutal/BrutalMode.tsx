@@ -21,6 +21,7 @@ import toast from 'react-hot-toast';
 
 import { useAuth } from '../../context/AuthContext';
 import apiClient, { apiErrorMessage } from '../../services/api';
+import { hasElevatedAccess } from '../../utils/access';
 import {
   Button,
   EmptyState,
@@ -181,7 +182,7 @@ export default function BrutalMode() {
     setTimeout(() => setBanner(''), 6000);
   };
 
-  const isAdmin = user?.role === 'admin' || Boolean(user?.enterpriseId);
+  const isAdmin = hasElevatedAccess(user);
   const targetInScope = scope.some((entry) => entry.target_url === target.trim()) || isLabTarget(target);
   const autoConfirm = isAdmin && targetInScope;
 

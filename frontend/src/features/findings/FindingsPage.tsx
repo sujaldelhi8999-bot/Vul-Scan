@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import toast from 'react-hot-toast';
 import { Database, FileSearch, Loader2, Search as SearchIcon, ShieldCheck, Sparkles } from 'lucide-react';
 
@@ -21,6 +21,8 @@ import {
 import {
   default as apiClient,
   apiErrorMessage,
+  getFinding,
+  getFindingsPage,
   updateFindingRemediation,
   updateFindingRiskStatus,
   verifyFindingFix,
@@ -341,25 +343,74 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
 }
 
 export default function FindingsPage() {
-  const { findings } = usePhantomData();
+  const pageSize = 50;
   const [severity, setSeverity] = useState<Severity | 'ALL'>('ALL');
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState('All');
+  const [page, setPage] = useState(0);
+  const [findings, setFindings] = useState<Finding[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [selectedSummary, setSelectedSummary] = useState<Finding | null>(null);
   const [selected, setSelected] = useState<Finding | null>(null);
-  const categories = useMemo(() => ['All', ...Array.from(new Set(findings.map((f) => f.category))).sort()], [findings]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const categories = useMemo(() => {
+    const values = new Set(findings.map((f) => f.category).filter(Boolean));
+    if (category !== 'All') values.add(category);
+    return ['All', ...Array.from(values).sort()];
+  }, [category, findings]);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
-  const filtered = findings.filter((finding) => {
-    const ms = severity === 'ALL' || finding.severity === severity;
-    const mc = category === 'All' || finding.category === category;
-    const haystack = `${finding.title} ${finding.target} ${finding.endpoint} ${finding.category} ${finding.agent} ${finding.cve_id ?? ''}`.toLowerCase();
-    return ms && mc && haystack.includes(query.toLowerCase());
-  });
+  useEffect(() => { setPage(0); }, [severity, category, query]);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError(null);
+    getFindingsPage({
+      limit: pageSize,
+      offset: page * pageSize,
+      severity,
+      category,
+      q: query,
+    })
+      .then((result) => {
+        if (!active) return;
+        setFindings(result.items);
+        setTotal(result.total);
+      })
+      .catch((err) => {
+        if (!active) return;
+        setError(apiErrorMessage(err, 'Unable to load findings.'));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => { active = false; };
+  }, [category, page, query, severity]);
+
+  const openFinding = (finding: Finding) => {
+    setSelectedSummary(finding);
+    setSelected(finding);
+    setDetailLoading(true);
+    getFinding(finding.id)
+      .then((detail) => setSelected(detail))
+      .catch((err) => toast.error(apiErrorMessage(err, 'Unable to load finding details.')))
+      .finally(() => setDetailLoading(false));
+  };
+
+  const closeFinding = () => {
+    setSelectedSummary(null);
+    setSelected(null);
+    setDetailLoading(false);
+  };
 
   return (
     <Page>
-      <PageHeader
-        title="Findings"
-        description={`${findings.length} total findings across all scans`}
+        <PageHeader
+          title="Findings"
+        description={`${total} total findings across all scans`}
         action={
           <div className="relative w-56">
             <SearchIcon className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-subtle)]" />
@@ -390,8 +441,17 @@ export default function FindingsPage() {
 
       {/* Findings table */}
       <Panel>
-        {filtered.length ? (
+        {loading ? (
+          <div className="p-5 text-xs text-[var(--text-muted)]">Loading findings...</div>
+        ) : error ? (
+          <div className="p-5 text-xs text-[var(--danger)]">{error}</div>
+        ) : findings.length ? (
           <>
+            {detailLoading && selectedSummary ? (
+              <div className="border-b border-[var(--border-light)] px-4 py-2 text-xs text-[var(--text-muted)]">
+                Loading details for {selectedSummary.title}...
+              </div>
+            ) : null}
             {/* Desktop table */}
             <div className="hidden md:block">
               <div
@@ -401,10 +461,10 @@ export default function FindingsPage() {
                 <span>Severity</span><span>Finding</span><span>Asset</span><span>Category</span><span>Status</span><span>Detected</span>
               </div>
               <div className="divide-y divide-[var(--border-light)]">
-                {filtered.map((finding) => (
+                {findings.map((finding) => (
                   <button
                     key={finding.id}
-                    onClick={() => setSelected(finding)}
+                    onClick={() => openFinding(finding)}
                     className="grid w-full gap-3 px-4 py-2.5 text-left transition-colors hover:bg-[var(--surface-hover)]"
                     style={{ gridTemplateColumns: '80px 1.5fr 1fr 120px 85px 100px' }}
                   >
@@ -421,8 +481,8 @@ export default function FindingsPage() {
 
             {/* Mobile cards */}
             <div className="space-y-2 p-4 md:hidden">
-              {filtered.map((finding) => (
-                <button key={finding.id} onClick={() => setSelected(finding)} className="w-full rounded-xl border border-[var(--border-light)] p-3.5 text-left">
+              {findings.map((finding) => (
+                <button key={finding.id} onClick={() => openFinding(finding)} className="w-full rounded-xl border border-[var(--border-light)] p-3.5 text-left">
                   <div className="mb-2 flex items-center justify-between gap-2">
                     <SeverityBadge severity={finding.severity} compact />
                     <StatusBadge status={finding.remediation_status ?? 'OPEN'} />
@@ -433,19 +493,26 @@ export default function FindingsPage() {
                 </button>
               ))}
             </div>
+            <div className="flex items-center justify-between border-t border-[var(--border-light)] px-4 py-3 text-xs text-[var(--text-muted)]">
+              <span>Page {page + 1} of {totalPages}</span>
+              <div className="flex gap-2">
+                <Button variant="secondary" disabled={page === 0} onClick={() => setPage((current) => Math.max(0, current - 1))}>Previous</Button>
+                <Button variant="secondary" disabled={page + 1 >= totalPages} onClick={() => setPage((current) => current + 1)}>Next</Button>
+              </div>
+            </div>
           </>
         ) : (
           <div className="p-5">
             <EmptyState
               icon={<FileSearch className="h-6 w-6 text-[var(--text-subtle)]" />}
               title="No findings"
-              description={findings.length ? 'No findings match the current filters.' : 'Your scans found no issues.'}
+              description={total ? 'No findings match the current filters.' : 'Your scans found no issues.'}
             />
           </div>
         )}
       </Panel>
 
-      <FindingDrawer finding={selected} onClose={() => setSelected(null)} />
+      <FindingDrawer finding={selected} onClose={closeFinding} />
     </Page>
   );
 }

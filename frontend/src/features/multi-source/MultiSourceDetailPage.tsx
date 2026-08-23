@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { ArrowLeft, GitBranch, Link2, Loader2, RefreshCw, ShieldCheck, Workflow } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, ExternalLink, GitBranch, Link2, Loader2, RefreshCw, ShieldCheck, Workflow } from 'lucide-react';
 
 import {
   Button,
@@ -18,34 +18,14 @@ import {
   getSourceCorrelations,
 } from '../../services/api';
 import type {
+  Finding,
   MultiSourceScanResponse,
   SourceCorrelationGroup,
   SourceCorrelationsResponse,
 } from '../../types';
 import { formatDateTime } from '../../utils/derived';
 
-const MIN_SCAN_DURATION_MINUTES = 5;
-const MAX_SCAN_DURATION_MINUTES = 1440;
-
-function clampScanDuration(minutes: number) {
-  if (!Number.isFinite(minutes) || minutes <= 0) return 120;
-  return Math.min(Math.max(minutes, MIN_SCAN_DURATION_MINUTES), MAX_SCAN_DURATION_MINUTES);
-}
-
-function formatElapsed(seconds: number) {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  return `${m}:${s.toString().padStart(2, '0')}`;
-}
-
-function getElapsedSeconds(scan: MultiSourceScanResponse): number | null {
-  const startedAt = scan.started_at ? Date.parse(scan.started_at) : null;
-  if (!startedAt || Number.isNaN(startedAt)) return null;
-  const endedAt = scan.completed_at ? Date.parse(scan.completed_at) : Date.now();
-  return Math.max(0, Math.floor((endedAt - startedAt) / 1000));
-}
+const TERMINAL = new Set(['complete', 'error', 'cancelled', 'failed']);
 
 export default function MultiSourceDetailPage() {
   const { scan_id } = useParams<{ scan_id: string }>();
@@ -53,16 +33,8 @@ export default function MultiSourceDetailPage() {
   const [status, setStatus] = useState<MultiSourceScanResponse | null>(null);
   const [correlations, setCorrelations] = useState<SourceCorrelationsResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [expandedFinding, setExpandedFinding] = useState<number | null>(null);
   const loadRef = useRef<() => Promise<void>>(async () => {});
-
-  const storedTimeout = Number(sessionStorage.getItem(`multiSourceScanTimeout:${scanId}`));
-  const maxDurationMinutes = clampScanDuration(status?.max_duration_minutes || storedTimeout || 120);
-
-  const elapsed = status ? getElapsedSeconds(status) : null;
-  const elapsedDisplay = elapsed !== null ? formatElapsed(elapsed) : '--:--';
-  const limitSeconds = maxDurationMinutes * 60;
-  const usagePercent = elapsed !== null ? Math.min(100, Math.round((elapsed / limitSeconds) * 100)) : 0;
-  const usageColor = usagePercent >= 90 ? 'bg-red-500' : usagePercent >= 70 ? 'bg-yellow-500' : 'bg-[var(--brand)]';
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -85,27 +57,10 @@ export default function MultiSourceDetailPage() {
 
   useEffect(() => {
     if (!status) return;
-    if (['complete', 'error', 'cancelled'].includes(status.overall_status)) return;
+    if (TERMINAL.has(status.overall_status)) return;
     const interval = setInterval(() => { void loadRef.current(); }, 4000);
     return () => clearInterval(interval);
   }, [status?.overall_status]);
-
-  useEffect(() => {
-    if (!status) return;
-    if (['complete', 'error', 'cancelled'].includes(status.overall_status)) return;
-    const startedAt = status.started_at ? Date.parse(status.started_at) : null;
-    if (!startedAt || Number.isNaN(startedAt)) return;
-    const timeoutMs = maxDurationMinutes * 60 * 1000;
-    const remainingMs = (startedAt + timeoutMs) - Date.now();
-    if (remainingMs <= 0) {
-      toast.error(`Scan timed out after ${maxDurationMinutes} minutes. Please check scan status.`);
-      return;
-    }
-    const timeout = setTimeout(() => {
-      toast.error(`Scan timed out after ${maxDurationMinutes} minutes. Please check scan status.`);
-    }, remainingMs);
-    return () => clearTimeout(timeout);
-  }, [status?.started_at, status?.overall_status, maxDurationMinutes]);
 
   if (loading && !status) {
     return (
@@ -123,7 +78,7 @@ export default function MultiSourceDetailPage() {
     return (
       <Page>
         <Panel>
-          <EmptyState icon={<GitBranch className="h-6 w-6 text-[var(--text-subtle)]" />} title="Scan not found" description={`No multi-source scan exists with id ${scanId}.`} />
+          <EmptyState icon={<GitBranch className="h-6 w-6 text-[var(--text-subtle)]" />} title="Analysis not found" description={`No local code analysis exists with id ${scanId}.`} />
         </Panel>
       </Page>
     );
@@ -131,6 +86,8 @@ export default function MultiSourceDetailPage() {
 
   const summary = correlations?.summary;
   const groups: SourceCorrelationGroup[] = correlations?.groups ?? [];
+  const findings: Finding[] = status.findings ?? [];
+  const active = !TERMINAL.has(status.overall_status);
 
   return (
     <Page>
@@ -140,7 +97,7 @@ export default function MultiSourceDetailPage() {
         action={
           <div className="flex items-center gap-2">
             <Link to="/multi-source">
-              <Button variant="secondary"><ArrowLeft className="h-3.5 w-3.5" />Wizard</Button>
+              <Button variant="secondary"><ArrowLeft className="h-3.5 w-3.5" />Local Analysis</Button>
             </Link>
             <Button variant="secondary" onClick={() => { void load(); }}>
               <RefreshCw className="h-3.5 w-3.5" />
@@ -149,47 +106,44 @@ export default function MultiSourceDetailPage() {
         }
       />
 
-      {/* Status overview */}
-      <div className="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-        <Panel className="!p-4">
-          <div className="text-[10px] font-semibold text-[var(--text-subtle)]">Status</div>
-          <div className="mt-1.5"><StatusBadge status={status.overall_status} /></div>
-        </Panel>
-        <Panel className="!p-4">
-          <div className="text-[10px] font-semibold text-[var(--text-subtle)]">Total findings</div>
-          <div className="mt-1.5 text-lg font-semibold text-[var(--text-strong)]">{status.total_findings}</div>
-        </Panel>
-        <Panel className="!p-4">
-          <div className="text-[10px] font-semibold text-[var(--text-subtle)]">Correlations</div>
-          <div className="mt-1.5 text-lg font-semibold text-[var(--brand)]">{status.correlated_findings_count}</div>
-        </Panel>
-        <Panel className="!p-4">
-          <div className="text-[10px] font-semibold text-[var(--text-subtle)]">Created</div>
-          <div className="mt-1.5 text-xs text-[var(--text-default)]">{formatDateTime(status.created_at)}</div>
-        </Panel>
-        <Panel className="!p-4">
-          <div className="text-[10px] font-semibold text-[var(--text-subtle)]">Elapsed / limit</div>
-          <div className="mt-1.5 text-lg font-semibold text-[var(--text-strong)] font-mono">{elapsedDisplay}</div>
-          <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-[var(--surface-tertiary)]">
-            <div className={`h-full rounded-full transition-all ${usageColor}`} style={{ width: `${usagePercent}%` }} />
-          </div>
-          <div className="mt-0.5 text-[10px] text-[var(--text-subtle)]">{usagePercent}% of {maxDurationMinutes} min</div>
-        </Panel>
-      </div>
-
-      {status.overall_progress < 100 && !['complete', 'error', 'cancelled'].includes(status.overall_status) ? (
-        <Panel className="mb-4">
-          <div className="flex items-center gap-3">
-            <Loader2 className="h-4 w-4 animate-spin text-[var(--brand)]" />
-            <div className="flex-1">
-              <div className="mb-1 text-[11px] text-[var(--text-muted)]">Scan in progress: {status.overall_progress}%</div>
-              <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--surface-tertiary)]">
-                <div className="h-full rounded-full bg-[var(--brand)] transition-all" style={{ width: `${status.overall_progress}%` }} />
+      <Panel className="mb-4">
+        <div className="p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span
+                className={`flex h-2 w-2 shrink-0 rounded-full ${
+                  status.overall_status === 'complete' ? 'bg-green-500' : active ? 'animate-pulse bg-amber-500' : 'bg-red-500'
+                }`}
+              />
+              <span className="truncate font-mono text-xs text-[var(--text-default)]">{status.name}</span>
+              <StatusBadge status={status.overall_status} />
+              <span className="text-[11px] text-[var(--text-subtle)]">Created {formatDateTime(status.created_at)}</span>
+            </div>
+            {active ? (
+              <div className="flex items-center gap-3">
+                <div className="h-1.5 w-40 overflow-hidden rounded-full bg-[var(--surface-tertiary)]">
+                  <div
+                    className="h-full rounded-full bg-[var(--brand)] transition-all"
+                    style={{ width: `${Math.max(3, status.overall_progress)}%` }}
+                  />
+                </div>
+                <span className="text-[11px] font-medium text-[var(--text-muted)]">{status.overall_progress}%</span>
               </div>
+            ) : null}
+            <div className="flex items-center gap-3 text-xs">
+              {status.overall_status === 'complete' ? (
+                <>
+                  <ShieldCheck className="h-4 w-4 text-green-500" />
+                  <span className="font-semibold text-[var(--text-default)]">{status.total_findings} findings</span>
+                </>
+              ) : null}
+              {status.overall_status === 'error' || status.overall_status === 'failed' ? (
+                <span className="font-semibold text-[var(--danger)]">Analysis ended</span>
+              ) : null}
             </div>
           </div>
-        </Panel>
-      ) : null}
+        </div>
+      </Panel>
 
       <div className="grid gap-4 lg:grid-cols-[1fr_340px]">
         <div className="space-y-4">
@@ -197,10 +151,12 @@ export default function MultiSourceDetailPage() {
           <Panel>
             <h3 className="mb-3 text-xs font-semibold text-[var(--text-strong)]">Sources</h3>
             <div className="space-y-2">
-              {status.sources.map((source) => (
+              {status.sources.map((source) => {
+                const sourceStatus = !active && ['queued', 'running', 'pending'].includes(source.status) ? 'failed' : source.status;
+                return (
                 <div key={`${source.source_type}-${source.source_identifier}`} className="rounded-xl border border-[var(--border-light)] bg-[var(--surface-secondary)] p-3">
                   <div className="flex items-center gap-2">
-                    <StatusBadge status={source.status} />
+                    <StatusBadge status={sourceStatus} />
                     <span className="truncate text-xs font-medium text-[var(--text-strong)]">{source.source_identifier}</span>
                   </div>
                   <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -224,9 +180,90 @@ export default function MultiSourceDetailPage() {
                     <p className="mt-1.5 text-[10px] text-[var(--danger)]">{source.error_message}</p>
                   ) : null}
                 </div>
-              ))}
+                );
+              })}
             </div>
           </Panel>
+
+          {/* Findings */}
+          {status.overall_status === 'complete' && findings.length === 0 ? (
+            <Panel>
+              <EmptyState
+                icon={<ShieldCheck className="h-5 w-5" />}
+                title="No findings"
+                description="No secrets, insecure patterns, vulnerable dependencies, or IaC issues were detected in this uploaded codebase."
+              />
+            </Panel>
+          ) : null}
+
+          {findings.length > 0 ? (
+            <Panel>
+              <div className="p-3">
+                <h3 className="px-1 pb-2 text-xs font-bold uppercase tracking-wide text-[var(--text-muted)]">
+                  Findings ({findings.length})
+                </h3>
+                <div className="space-y-1.5">
+                  {findings.map((finding) => (
+                    <button
+                      key={finding.id}
+                      type="button"
+                      onClick={() => setExpandedFinding(expandedFinding === finding.id ? null : finding.id)}
+                      className="w-full rounded-xl border border-slate-200 bg-white p-3 text-left shadow-sm transition-colors hover:border-slate-300 hover:bg-slate-50"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <SeverityBadge severity={finding.severity} />
+                            <span className="text-xs font-semibold text-slate-950">{finding.title}</span>
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
+                            <span>{finding.category}</span>
+                            {finding.module ? <span className="font-mono">{finding.module}</span> : null}
+                            {finding.file_path ? <span className="truncate font-mono">{finding.file_path}{finding.line_number ? `:${finding.line_number}` : ''}</span> : null}
+                            {finding.endpoint && !finding.file_path ? <span className="truncate font-mono">{finding.endpoint}</span> : null}
+                            {finding.cwe ? <span className="font-mono">{finding.cwe}</span> : null}
+                            {finding.cvss_score != null ? <span>CVSS {finding.cvss_score}</span> : null}
+                          </div>
+                        </div>
+                        {(finding.evidence || finding.code_snippet) ? <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-slate-400" /> : null}
+                      </div>
+
+                      {expandedFinding === finding.id ? (
+                        <div className="mt-3 space-y-2 border-t border-slate-200 pt-3">
+                          {(finding.code_snippet || finding.evidence) ? (
+                            <pre className="overflow-x-auto rounded-lg bg-slate-50 p-3 font-mono text-[11px] leading-relaxed text-slate-800">
+                              {finding.code_snippet || finding.evidence}
+                            </pre>
+                          ) : null}
+                          {finding.impact ? (
+                            <p className="text-[11px] text-slate-600">
+                              <span className="font-semibold">Impact:</span> {finding.impact}
+                            </p>
+                          ) : null}
+                          {(finding.recommendation || finding.recommended_fix || finding.fix_recommendation) ? (
+                            <p className="text-[11px] text-slate-600">
+                              <span className="font-semibold">Fix:</span> {finding.recommendation || finding.recommended_fix || finding.fix_recommendation}
+                            </p>
+                          ) : null}
+                          {finding.cve_id ? (
+                            <a
+                              href={`https://nvd.nist.gov/vuln/detail/${finding.cve_id}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="inline-flex items-center gap-1 text-[11px] font-medium text-[var(--brand)] hover:underline"
+                              onClick={(event) => event.stopPropagation()}
+                            >
+                              {finding.cve_id} <ExternalLink className="h-3 w-3" />
+                            </a>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </Panel>
+          ) : null}
 
           {/* Correlated finding groups */}
           <Panel>

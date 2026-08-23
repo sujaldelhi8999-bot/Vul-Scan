@@ -37,6 +37,7 @@ import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
 
 import { usePhantomData } from '../../hooks/usePhantomData';
 import { apiErrorMessage, askVulScan } from '../../services/api';
+import { hasElevatedAccess } from '../../utils/access';
 import { deriveAssets, deriveNotifications, deriveTechnologies, relativeTime, targetName } from '../../utils/derived';
 import { Button, cx, Drawer, EmptyState, Select, StatusBadge } from '../ui/Primitives';
 import { useAuth } from '../../context/AuthContext';
@@ -54,7 +55,7 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { label: 'Dashboard', path: '/dashboard', icon: Home },
       { label: 'Defend Scan', path: '/scan', icon: Activity },
-      { label: 'Multi-Source', path: '/multi-source', icon: Layers3 },
+      { label: 'Local Code Analysis', path: '/multi-source', icon: Layers3 },
     ],
   },
   {
@@ -72,9 +73,8 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { label: 'Authorized Testing', path: '/authorized-testing', icon: LockKeyhole },
       { label: 'DoS Testing', path: '/private/dos', icon: Bomb },
-      { label: 'Code Analysis', path: '/code-analysis', icon: FileSearch },
+      { label: 'GitHub Repo Analysis', path: '/code-analysis', icon: FileSearch },
       { label: 'Brutal Mode', path: '/brutal', icon: Skull },
-      { label: 'Self Audit', path: '/self-audit', icon: Stethoscope },
     ],
   },
   {
@@ -105,14 +105,15 @@ const routeDetails: Record<string, { title: string; description: string }> = {
   '/notifications': { title: 'Notifications', description: 'Events from findings and system activity.' },
   '/system-health': { title: 'System Health', description: 'Backend, realtime, and agent availability.' },
   '/settings': { title: 'Settings', description: 'Runtime configuration reference.' },
+  '/multi-source': { title: 'Local Code Analysis', description: 'Run local ZIP and path-based code analysis.' },
   '/authorized-testing': { title: 'Authorized Testing', description: 'Controlled security testing for approved targets.' },
   '/private/dos': { title: 'DoS Testing', description: 'Simulate Denial of Service attacks on authorized targets.' },
-  '/code-analysis': { title: 'Code Analysis', description: 'Scan GitHub repositories for secrets, insecure patterns, and vulnerable dependencies.' },
+  '/code-analysis': { title: 'GitHub Repo Analysis', description: 'Scan GitHub repositories for secrets, insecure patterns, and vulnerable dependencies.' },
   '/brutal': { title: 'Brutal Mode', description: 'Active exploitation, interactive shells, post-exploitation, lateral movement & exfiltration.' },
   '/attack-planner': { title: 'Attack Planner', description: 'Analyze targets and generate prioritized attack plans with realistic commands.' },
   '/quality': { title: 'Scan Quality', description: 'Learning-driven accuracy and tuning recommendations.' },
   '/profile': { title: 'Profile', description: 'Your account details and session information.' },
-  '/enterprise': { title: 'Enterprise Management', description: 'Employees, approval workflows, and audit logs.' },
+  '/enterprise': { title: 'Enterprise Workspace', description: 'Enterprise requests, approvals, and notifications.' },
 };
 
 function currentRoute(pathname: string) {
@@ -167,7 +168,9 @@ function Sidebar({
           const items = group.items.filter(
             (item) => {
               // Admin-only pages
-              if ((item.path === '/code-analysis' || item.path === '/brutal') && user?.role !== 'admin' && !user?.enterpriseId) return false;
+              const elevatedOnly = ['/code-analysis', '/brutal', '/private/dos', '/intelligence', '/attack-planner', '/quality'];
+              if (elevatedOnly.includes(item.path) && !hasElevatedAccess(user)) return false;
+              if (item.path === '/enterprise' && !user?.enterpriseId) return false;
               return true;
             },
           );

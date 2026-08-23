@@ -10,6 +10,7 @@ from app.auth_middleware import get_current_user
 from app.config import get_settings
 from app.database import (
     add_audit_log,
+    count_findings,
     get_connection,
     get_exploitation_results_map,
     get_finding,
@@ -59,6 +60,13 @@ class ApplyPatchRequest(BaseModel):
     verify_after: bool = Field(default=True, description="Whether to run verification after applying patch")
 
 
+class FindingsPageResponse(BaseModel):
+    items: list[Finding]
+    total: int
+    limit: int
+    offset: int
+
+
 async def _verify_finding_ownership(finding_id: int, user: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     finding = await get_finding(finding_id)
     if not finding:
@@ -89,14 +97,75 @@ async def _attached_source_root(scan_id: int) -> str | None:
 @router.get("", response_model=list[Finding])
 async def all_findings(
     scan_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    severity: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=200),
+    include_details: bool = Query(default=False),
     user: dict = Depends(get_current_user),
 ) -> list[Finding]:
-    rows = await list_findings(scan_id, user["id"], enterprise_id_for(user))
+    rows = await list_findings(
+        scan_id,
+        user["id"],
+        enterprise_id_for(user),
+        limit=limit,
+        offset=offset,
+        include_details=include_details,
+        severity=severity,
+        category=category,
+        query=q,
+    )
     rows = filter_findings_for_user(rows, user)
-    poc_map = await get_exploitation_results_map([row["id"] for row in rows])
-    for row in rows:
-        row["poc"] = poc_map.get(int(row["id"]))
+    if include_details:
+        poc_map = await get_exploitation_results_map([row["id"] for row in rows])
+        for row in rows:
+            row["poc"] = poc_map.get(int(row["id"]))
     return [Finding(**row) for row in rows]
+
+
+@router.get("/page", response_model=FindingsPageResponse)
+async def findings_page(
+    scan_id: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    severity: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=200),
+    user: dict = Depends(get_current_user),
+) -> FindingsPageResponse:
+    rows = await list_findings(
+        scan_id,
+        user["id"],
+        enterprise_id_for(user),
+        limit=limit,
+        offset=offset,
+        include_details=False,
+        severity=severity,
+        category=category,
+        query=q,
+    )
+    rows = filter_findings_for_user(rows, user)
+    total = await count_findings(
+        scan_id,
+        user["id"],
+        enterprise_id_for(user),
+        severity=severity,
+        category=category,
+        query=q,
+    )
+    return FindingsPageResponse(items=[Finding(**row) for row in rows], total=total, limit=limit, offset=offset)
+
+
+@router.get("/{finding_id}", response_model=Finding)
+async def finding_detail(
+    finding_id: int,
+    user: dict = Depends(get_current_user),
+) -> Finding:
+    finding, _scan = await _verify_finding_ownership(finding_id, user)
+    poc_map = await get_exploitation_results_map([finding_id])
+    finding["poc"] = poc_map.get(finding_id)
+    return Finding(**finding)
 
 
 @router.post("/{finding_id}/verify")

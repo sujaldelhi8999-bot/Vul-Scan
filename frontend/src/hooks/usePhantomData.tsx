@@ -106,7 +106,7 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
       const requests = Promise.allSettled([
         getHealth(),
         getScanHistory(),
-        getFindings(),
+        getFindings(undefined, { limit: 100 }),
         getLogs(),
         getAgentStatuses(),
         getSelfAuditStatus()

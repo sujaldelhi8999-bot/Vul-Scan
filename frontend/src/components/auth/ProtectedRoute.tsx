@@ -30,8 +30,11 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
   }
 
   const tierOrder = { FREE: 0, PRO: 1, ENTERPRISE: 2 } as const;
-  if (tierOrder[user.subscriptionTier] < tierOrder[requiredTier] && user.role !== 'admin') {
-    return <Navigate to="/pricing" replace state={{ from: location, message: 'Upgrade to Developer / Pro required' }} />;
+  const platformAdmin = user.role === 'admin' && !user.enterpriseId;
+  const enterpriseMember = Boolean(user.enterpriseId);
+  const tierSatisfiedByMembership = requiredTier === 'ENTERPRISE' && enterpriseMember;
+  if (tierOrder[user.subscriptionTier] < tierOrder[requiredTier] && !platformAdmin && !tierSatisfiedByMembership) {
+    return <Navigate to="/pricing" replace state={{ from: location, message: 'Upgrade to Pro / Plus required' }} />;
   }
 
   if (requireEnterprise && !user.enterpriseId) {

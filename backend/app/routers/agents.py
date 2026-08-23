@@ -60,7 +60,7 @@ async def agent_statuses(
     user: dict = Depends(get_current_user),
 ) -> list[AgentStatus]:
     exec_status = await get_execution_status()
-    if exec_status is not None and exec_status.get("lifecycle") not in ("IDLE", None):
+    if exec_status is not None and exec_status.get("lifecycle") in {"QUEUED", "STARTING", "RUNNING", "PAUSED"}:
         agent_states = exec_status.get("agent_states", [])
         if agent_states:
             name_map = {a["name"]: a["applicability"] for a in agent_states}

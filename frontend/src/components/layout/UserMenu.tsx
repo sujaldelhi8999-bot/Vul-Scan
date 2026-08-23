@@ -3,6 +3,7 @@ import { ChevronDown, LayoutDashboard, LogOut, Settings } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 import { useAuth } from '../../context/AuthContext';
+import { displayRole, hasElevatedAccess } from '../../utils/access';
 import { cx } from '../ui/Primitives';
 
 export default function UserMenu() {
@@ -33,6 +34,7 @@ export default function UserMenu() {
   const displayName = user.name || user.username || user.email || 'User';
   const emailDisplay = user.email || user.username || '';
   const initial = (displayName.charAt(0) || 'U').toUpperCase();
+  const roleLabel = displayRole(user);
 
   return (
     <div className="relative ml-2" ref={containerRef}>
@@ -48,13 +50,13 @@ export default function UserMenu() {
         </span>
 
         {/* Role / Plan Badge inside pill */}
-        {user.role === 'admin' || user.enterpriseId ? (
+        {hasElevatedAccess(user) ? (
           <span className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold bg-purple-50 border border-purple-200 text-purple-700">
-            {user.enterpriseId ? 'Enterprise Admin' : 'Admin'}
+            {roleLabel}
           </span>
-        ) : user.subscriptionTier === 'PRO' ? (
+        ) : user.subscriptionTier === 'PRO' || user.enterpriseId ? (
           <span className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold bg-amber-50 border border-amber-200 text-amber-700">
-            ⚡ Pro
+            {roleLabel}
           </span>
         ) : (
           <span className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-semibold bg-slate-50 border border-slate-200 text-slate-600">

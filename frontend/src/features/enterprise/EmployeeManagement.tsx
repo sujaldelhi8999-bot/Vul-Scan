@@ -185,7 +185,7 @@ export default function EmployeeManagement() {
             </div>
             <div className="mt-2.5 flex items-center justify-between">
               <p className="text-[10px] text-[var(--text-subtle)]">
-                Employees receive full Enterprise scan and product access. Only the owner manages members and settings.
+                Employees can request approval for protected enterprise actions. Only the owner or platform admin manages members and settings.
               </p>
               <Button type="submit" variant="primary" disabled={creating}>
                 {creating ? 'Creating...' : 'Create Employee'}
@@ -206,13 +206,13 @@ export default function EmployeeManagement() {
                       <span className={`h-1.5 w-1.5 rounded-full ${emp.is_active ? 'bg-green-500' : 'bg-gray-400'}`} />
                       <span className="truncate text-xs font-semibold text-[var(--text-strong)]">{emp.name || emp.email}</span>
                       <span className="rounded bg-[var(--surface-tertiary)] px-1.5 py-0.5 text-[10px] font-semibold uppercase text-[var(--text-muted)]">
-                        {emp.role}
+                        Enterprise Employee
                       </span>
                     </div>
                     <div className="mt-0.5 truncate pl-3.5 text-[11px] text-[var(--text-subtle)]">{emp.email}</div>
                   </div>
 
-                  <span className="text-[10px] font-semibold text-[var(--text-subtle)]">Enterprise Admin · ALL findings</span>
+                  <span className="text-[10px] font-semibold text-[var(--text-subtle)]">Enterprise Employee · approval required</span>
 
                   <Button variant="ghost" onClick={() => openPasswordModal(emp)} title="Manage password" aria-label={`Manage password for ${emp.email}`}>
                     <KeyRound className="h-3.5 w-3.5" />
@@ -295,7 +295,7 @@ export default function EmployeeManagement() {
             </div>
 
             <div className="rounded-xl border border-[var(--border-light)] bg-[var(--surface-secondary)] p-3 text-[11px] leading-relaxed text-[var(--text-muted)]">
-              Every reset is recorded in the enterprise audit log under the acting manager/admin account.
+              Every reset is recorded in the enterprise audit log under the acting owner/admin account.
             </div>
           </div>
         ) : null}

@@ -1,8 +1,7 @@
 """
 Enterprise RBAC Router — employee management, approval workflow, audit logs.
 
-Roles: admin > manager > employee. Legacy 'user' accounts keep full access.
-Permission levels: view < propose < execute (enforced for enterprise roles).
+Roles: owner > employee. Enterprise employees request approval from the owner.
 """
 
 import base64
@@ -44,8 +43,7 @@ from app.services.enterprise_access import (
 router = APIRouter(prefix="/api/enterprise", tags=["Enterprise"])
 logger = logging.getLogger("phantomscan.enterprise")
 
-ROLES = ("employee", "manager")
-PERMISSION_ORDER = {"view": 1, "propose": 2, "execute": 3}
+ROLES = ("employee",)
 REQUEST_TYPES = ("code_fix", "remediation")
 CHANGE_TYPES = ("code_patch", "text_update", "manual")
 URGENCIES = ("low", "normal", "high", "critical")
@@ -95,7 +93,7 @@ class EnterpriseSettingsUpdate(BaseModel):
 
 # ── Dependencies / helpers ────────────────────────────────────────────────────
 
-async def require_manager_or_admin(current_user: dict = Depends(get_current_user)) -> dict:
+async def require_owner_or_admin(current_user: dict = Depends(get_current_user)) -> dict:
     if not can_manage_members(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Enterprise owner access required")
     return current_user
@@ -149,17 +147,14 @@ async def add_enterprise_audit_log(
 
 
 def require_permission(permission: str):
-    """Require a minimum permission level. Admins/managers always pass;
-    legacy 'user' role is treated as execute for backward compatibility."""
+    """Require owner/admin access; employees should submit approval requests."""
     async def dependency(current_user: dict = Depends(get_current_user)) -> dict:
-        if current_user.get("role") in ("admin", "manager", "user"):
+        if can_manage_members(current_user):
             return current_user
-        level = PERMISSION_ORDER.get(current_user.get("permission_level", "view"), 0)
-        if level < PERMISSION_ORDER.get(permission, 0):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Permission '{permission}' required — submit an approval request instead",
-            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Permission '{permission}' requires enterprise owner approval",
+        )
         return current_user
     return dependency
 
@@ -232,8 +227,8 @@ async def _pick_approver(conn, enterprise_id: str, exclude_id: str) -> str | Non
         SELECT m.user_id FROM enterprise_memberships m
         JOIN users u ON u.id = m.user_id
         WHERE m.enterprise_id = ? AND m.is_active = 1
-          AND u.is_active = 1 AND m.user_id != ?
-        ORDER BY CASE m.role WHEN 'owner' THEN 0 ELSE 1 END, m.created_at ASC
+          AND u.is_active = 1 AND m.user_id != ? AND m.role = 'owner'
+        ORDER BY m.created_at ASC
         LIMIT 1
         """,
         (enterprise_id, exclude_id),
@@ -322,7 +317,7 @@ def _build_remediation_markdown(request_id: int, req_row: dict, findings: list[d
             lines.append(f"- **Fix:** {fix}")
         lines.append("")
     lines.append("---")
-    lines.append("_Generated automatically by PhantomScan after manager approval._")
+    lines.append("_Generated automatically by PhantomScan after owner approval._")
     return "\n".join(lines)
 
 
@@ -396,7 +391,7 @@ async def _push_remediation_pr(
 # ── Employee management ───────────────────────────────────────────────────────
 
 @router.get("/settings")
-async def enterprise_settings(current_user: dict = Depends(require_manager_or_admin)) -> dict[str, Any]:
+async def enterprise_settings(current_user: dict = Depends(require_owner_or_admin)) -> dict[str, Any]:
     enterprise_id = enterprise_id_for(current_user)
     async with get_connection() as conn:
         cursor = await conn.execute(
@@ -418,7 +413,7 @@ async def enterprise_settings(current_user: dict = Depends(require_manager_or_ad
 async def update_enterprise_settings(
     payload: EnterpriseSettingsUpdate,
     request: Request,
-    current_user: dict = Depends(require_manager_or_admin),
+    current_user: dict = Depends(require_owner_or_admin),
 ) -> dict[str, Any]:
     enterprise_id = enterprise_id_for(current_user)
     updates: list[str] = []
@@ -451,7 +446,7 @@ async def update_enterprise_settings(
 async def create_employee(
     payload: EmployeeCreate,
     request: Request,
-    current_user: dict = Depends(require_manager_or_admin),
+    current_user: dict = Depends(require_owner_or_admin),
 ) -> dict[str, Any]:
     if payload.role not in ROLES:
         raise HTTPException(status_code=400, detail=f"Role must be one of {list(ROLES)}")
@@ -497,7 +492,7 @@ async def create_employee(
                     "ALL",
                     1,
                     1,
-                    1,
+                    0,
                     0,
                 ),
             )
@@ -527,13 +522,13 @@ async def create_employee(
         "max_severity": "ALL",
         "can_request_audit": True,
         "can_request_fix": True,
-        "can_approve": True,
+        "can_approve": False,
         "message": "Employee created with the permanent password supplied by the administrator.",
     }
 
 
 @router.get("/users")
-async def list_employees(current_user: dict = Depends(require_manager_or_admin)) -> list[dict[str, Any]]:
+async def list_employees(current_user: dict = Depends(require_owner_or_admin)) -> list[dict[str, Any]]:
     enterprise_id = enterprise_id_for(current_user)
     async with get_connection() as conn:
         cursor = await conn.execute(
@@ -557,7 +552,7 @@ async def update_employee(
     user_id: str,
     payload: EmployeeUpdate,
     request: Request,
-    current_user: dict = Depends(require_manager_or_admin),
+    current_user: dict = Depends(require_owner_or_admin),
 ) -> dict[str, Any]:
     enterprise_id = enterprise_id_for(current_user)
     async with get_connection() as conn:
@@ -576,11 +571,8 @@ async def update_employee(
     membership_sets, membership_params = [], []
     if any(value is not None for value in (payload.max_severity, payload.can_request_audit, payload.can_request_fix, payload.can_approve)):
         membership_sets.extend(["max_severity = ?", "can_request_audit = ?", "can_request_fix = ?", "can_approve = ?"])
-        membership_params.extend(["ALL", 1, 1, 1])
-    if payload.role == "manager":
-        membership_sets.extend(["can_approve = ?", "can_manage_members = ?", "max_severity = ?"])
-        membership_params.extend([1, 0, "ALL"])
-    elif payload.role == "employee":
+        membership_params.extend(["ALL", 1, 1, 0])
+    if payload.role == "employee":
         membership_sets.append("can_manage_members = ?")
         membership_params.append(0)
     if payload.is_active is not None:
@@ -619,7 +611,7 @@ async def update_employee(
 async def deactivate_employee(
     user_id: str,
     request: Request,
-    current_user: dict = Depends(require_manager_or_admin),
+    current_user: dict = Depends(require_owner_or_admin),
 ) -> dict[str, Any]:
     enterprise_id = enterprise_id_for(current_user)
     async with get_connection() as conn:
@@ -669,7 +661,7 @@ async def _set_employee_password(enterprise_id: str, user_id: str, new_password:
 async def reset_employee_password(
     user_id: str,
     request: Request,
-    current_user: dict = Depends(require_manager_or_admin),
+    current_user: dict = Depends(require_owner_or_admin),
 ) -> dict[str, Any]:
     """Generate a strong random password for the employee. The plaintext is
     returned exactly once (hashes are irreversible, so it cannot be viewed later)."""
@@ -695,7 +687,7 @@ async def set_employee_password(
     user_id: str,
     payload: PasswordSet,
     request: Request,
-    current_user: dict = Depends(require_manager_or_admin),
+    current_user: dict = Depends(require_owner_or_admin),
 ) -> dict[str, Any]:
     """Set a specific password chosen by the admin."""
     if user_id == current_user["id"]:

@@ -16,7 +16,7 @@ const tiers = [
   },
   {
     id: 'PRO',
-    name: 'Developer / Pro',
+    name: 'Pro / Plus',
     price: '₹999-₹2,499',
     suffix: '/month',
     purpose: 'Individual developers, freelancers, and small teams',
@@ -37,8 +37,7 @@ const tiers = [
 export default function PricingPage() {
   const { user } = useAuth();
 
-  const isProOrAdmin = user?.role === 'admin' || user?.subscriptionTier === 'PRO' || user?.subscriptionTier === 'ENTERPRISE';
-  const isFreeUser = user && !isProOrAdmin;
+  const isFreeUser = user?.subscriptionTier === 'FREE' && user.role !== 'admin';
 
   return (
     <div className="min-h-screen bg-[var(--app-canvas)] text-[var(--text-default)]">
@@ -53,9 +52,7 @@ export default function PricingPage() {
 
         <div className="mt-12 grid gap-6 lg:grid-cols-3">
           {tiers.map((tier) => {
-            const isCurrentPlan =
-              (tier.id === 'PRO' && isProOrAdmin) ||
-              (tier.id === 'FREE' && isFreeUser);
+            const isCurrentPlan = Boolean(user && tier.id === user.subscriptionTier);
 
             return (
               <section
@@ -72,7 +69,7 @@ export default function PricingPage() {
                 <div>
                   <div className="flex items-center justify-between">
                     <div className="text-base font-bold text-[var(--text-strong)]">
-                      {tier.id === 'PRO' ? 'Developer / Pro' : tier.name}
+                      {tier.id === 'PRO' ? 'Pro / Plus' : tier.name}
                     </div>
                     {isCurrentPlan ? (
                       <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 dark:bg-emerald-950/60 px-3 py-1 text-[11px] font-bold text-emerald-700 dark:text-emerald-300">
@@ -118,7 +115,7 @@ export default function PricingPage() {
                       to="/register"
                       className="inline-flex w-full items-center justify-center rounded-[var(--radius-control)] bg-[var(--brand)] px-4 py-2.5 text-xs font-semibold text-white shadow-sm hover:bg-[var(--brand-hover)] transition-colors"
                     >
-                      Upgrade to Developer / Pro
+                      Upgrade to Pro / Plus
                     </Link>
                   ) : tier.id === 'ENTERPRISE' ? (
                     <a

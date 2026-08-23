@@ -1864,20 +1864,56 @@ async def get_scan(scan_id: int) -> dict[str, Any] | None:
 
 
 async def list_scans(user_id: str | None = None, enterprise_id: str | None = None) -> list[dict[str, Any]]:
+    count_columns = """
+        s.*,
+        COALESCE(COUNT(f.id), 0) AS findings_count,
+        COALESCE(SUM(CASE WHEN f.severity = 'CRITICAL'
+            AND f.remediation_status != 'RESOLVED'
+            AND f.verification_status != 'FIX_VERIFIED'
+            AND COALESCE(f.risk_status, 'ACTIVE') = 'ACTIVE' THEN 1 ELSE 0 END), 0) AS critical_findings_count,
+        COALESCE(SUM(CASE WHEN f.severity = 'HIGH'
+            AND f.remediation_status != 'RESOLVED'
+            AND f.verification_status != 'FIX_VERIFIED'
+            AND COALESCE(f.risk_status, 'ACTIVE') = 'ACTIVE' THEN 1 ELSE 0 END), 0) AS high_findings_count
+    """
     async with get_connection() as connection:
         if enterprise_id:
             cursor = await connection.execute(
-                "SELECT * FROM scans WHERE enterprise_id = ? AND target_url != ? ORDER BY created_at DESC, id DESC LIMIT 100",
+                f"""
+                SELECT {count_columns}
+                FROM scans s
+                LEFT JOIN findings f ON f.scan_id = s.id
+                WHERE s.enterprise_id = ? AND s.target_url != ?
+                GROUP BY s.id
+                ORDER BY s.created_at DESC, s.id DESC
+                LIMIT 100
+                """,
                 (enterprise_id, SYSTEM_TARGET_URL),
             )
         elif user_id:
             cursor = await connection.execute(
-                "SELECT * FROM scans WHERE user_id = ? AND target_url != ? ORDER BY created_at DESC, id DESC LIMIT 100",
+                f"""
+                SELECT {count_columns}
+                FROM scans s
+                LEFT JOIN findings f ON f.scan_id = s.id
+                WHERE s.user_id = ? AND s.target_url != ?
+                GROUP BY s.id
+                ORDER BY s.created_at DESC, s.id DESC
+                LIMIT 100
+                """,
                 (user_id, SYSTEM_TARGET_URL),
             )
         else:
             cursor = await connection.execute(
-                "SELECT * FROM scans WHERE target_url != ? ORDER BY created_at DESC, id DESC LIMIT 100",
+                f"""
+                SELECT {count_columns}
+                FROM scans s
+                LEFT JOIN findings f ON f.scan_id = s.id
+                WHERE s.target_url != ?
+                GROUP BY s.id
+                ORDER BY s.created_at DESC, s.id DESC
+                LIMIT 100
+                """,
                 (SYSTEM_TARGET_URL,),
             )
         return [dict(row) for row in await cursor.fetchall()]
@@ -2120,57 +2156,61 @@ async def list_findings(
     scan_id: int | None = None,
     user_id: str | None = None,
     enterprise_id: str | None = None,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+    include_details: bool = True,
+    severity: str | None = None,
+    category: str | None = None,
+    query: str | None = None,
 ) -> list[dict[str, Any]]:
+    summary_columns = """
+        f.id, f.scan_id, f.title, f.category, f.severity, f.confidence,
+        f.target, f.endpoint, f.agent, f.timestamp, f.cve_id, f.cvss_score,
+        f.cwe, f.version_affected, f.file_path, f.line_number, f.parameter,
+        f.module, f.remediation_status, f.verification_status, f.risk_status
+    """
+    columns = "f.*" if include_details else summary_columns
+    joins: list[str] = []
+    conditions: list[str] = []
+    values: list[Any] = []
+
+    if scan_id is not None:
+        conditions.append("f.scan_id = ?")
+        values.append(scan_id)
+    if enterprise_id:
+        joins.append("JOIN scans s ON f.scan_id = s.id")
+        conditions.append("s.enterprise_id = ?")
+        values.append(enterprise_id)
+    elif user_id is not None:
+        joins.append("JOIN scans s ON f.scan_id = s.id")
+        conditions.append("s.user_id = ?")
+        values.append(user_id)
+    if severity and severity.upper() != "ALL":
+        conditions.append("f.severity = ?")
+        values.append(severity.upper())
+    if category and category != "All":
+        conditions.append("f.category = ?")
+        values.append(category)
+    if query:
+        like = f"%{query.lower()}%"
+        conditions.append(
+            "(LOWER(f.title) LIKE ? OR LOWER(f.target) LIKE ? OR LOWER(f.endpoint) LIKE ? "
+            "OR LOWER(f.category) LIKE ? OR LOWER(f.agent) LIKE ? OR LOWER(COALESCE(f.cve_id, '')) LIKE ?)"
+        )
+        values.extend([like, like, like, like, like, like])
+
+    where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    pagination = ""
+    if limit is not None:
+        pagination = " LIMIT ? OFFSET ?"
+        values.extend([limit, max(0, offset)])
+
     async with get_connection() as connection:
-        if scan_id is not None:
-            if enterprise_id:
-                cursor = await connection.execute(
-                    """
-                    SELECT f.* FROM findings f
-                    JOIN scans s ON f.scan_id = s.id
-                    WHERE f.scan_id = ? AND s.enterprise_id = ?
-                    ORDER BY f.id ASC
-                    """,
-                    (scan_id, enterprise_id),
-                )
-            else:
-                if user_id is not None:
-                    cursor = await connection.execute(
-                        """
-                        SELECT f.* FROM findings f
-                        JOIN scans s ON f.scan_id = s.id
-                        WHERE f.scan_id = ? AND s.user_id = ?
-                        ORDER BY f.id ASC
-                        """,
-                        (scan_id, user_id),
-                    )
-                else:
-                    cursor = await connection.execute(
-                        "SELECT * FROM findings WHERE scan_id = ? ORDER BY id ASC",
-                        (scan_id,),
-                    )
-        elif enterprise_id:
-            cursor = await connection.execute(
-                """
-                SELECT f.* FROM findings f
-                JOIN scans s ON f.scan_id = s.id
-                WHERE s.enterprise_id = ?
-                ORDER BY f.id ASC
-                """,
-                (enterprise_id,),
-            )
-        elif user_id is not None:
-            cursor = await connection.execute(
-                """
-                SELECT f.* FROM findings f
-                JOIN scans s ON f.scan_id = s.id
-                WHERE s.user_id = ?
-                ORDER BY f.id ASC
-                """,
-                (user_id,),
-            )
-        else:
-            cursor = await connection.execute("SELECT * FROM findings ORDER BY id ASC")
+        cursor = await connection.execute(
+            f"SELECT {columns} FROM findings f {' '.join(dict.fromkeys(joins))}{where} ORDER BY f.id ASC{pagination}",
+            values,
+        )
         rows = [dict(row) for row in await cursor.fetchall()]
     for row in rows:
         raw = row.get("sources")
@@ -2188,6 +2228,85 @@ async def list_findings(
             except json.JSONDecodeError:
                 row["correlation"] = None
     return rows
+
+
+async def count_findings(
+    scan_id: int | None = None,
+    user_id: str | None = None,
+    enterprise_id: str | None = None,
+    *,
+    severity: str | None = None,
+    category: str | None = None,
+    query: str | None = None,
+) -> int:
+    joins: list[str] = []
+    conditions: list[str] = []
+    values: list[Any] = []
+
+    if scan_id is not None:
+        conditions.append("f.scan_id = ?")
+        values.append(scan_id)
+    if enterprise_id:
+        joins.append("JOIN scans s ON f.scan_id = s.id")
+        conditions.append("s.enterprise_id = ?")
+        values.append(enterprise_id)
+    elif user_id is not None:
+        joins.append("JOIN scans s ON f.scan_id = s.id")
+        conditions.append("s.user_id = ?")
+        values.append(user_id)
+    if severity and severity.upper() != "ALL":
+        conditions.append("f.severity = ?")
+        values.append(severity.upper())
+    if category and category != "All":
+        conditions.append("f.category = ?")
+        values.append(category)
+    if query:
+        like = f"%{query.lower()}%"
+        conditions.append(
+            "(LOWER(f.title) LIKE ? OR LOWER(f.target) LIKE ? OR LOWER(f.endpoint) LIKE ? "
+            "OR LOWER(f.category) LIKE ? OR LOWER(f.agent) LIKE ? OR LOWER(COALESCE(f.cve_id, '')) LIKE ?)"
+        )
+        values.extend([like, like, like, like, like, like])
+
+    where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    async with get_connection() as connection:
+        cursor = await connection.execute(
+            f"SELECT COUNT(*) AS count FROM findings f {' '.join(dict.fromkeys(joins))}{where}",
+            values,
+        )
+        row = await cursor.fetchone()
+    return int(row["count"] if row else 0)
+
+
+async def list_finding_categories(
+    scan_id: int | None = None,
+    user_id: str | None = None,
+    enterprise_id: str | None = None,
+) -> list[str]:
+    joins: list[str] = []
+    conditions = ["f.category != ''"]
+    values: list[Any] = []
+
+    if scan_id is not None:
+        conditions.append("f.scan_id = ?")
+        values.append(scan_id)
+    if enterprise_id:
+        joins.append("JOIN scans s ON f.scan_id = s.id")
+        conditions.append("s.enterprise_id = ?")
+        values.append(enterprise_id)
+    elif user_id is not None:
+        joins.append("JOIN scans s ON f.scan_id = s.id")
+        conditions.append("s.user_id = ?")
+        values.append(user_id)
+
+    where = f" WHERE {' AND '.join(conditions)}"
+    async with get_connection() as connection:
+        cursor = await connection.execute(
+            f"SELECT DISTINCT f.category FROM findings f {' '.join(dict.fromkeys(joins))}{where} ORDER BY f.category ASC",
+            values,
+        )
+        rows = await cursor.fetchall()
+    return [str(row["category"]) for row in rows]
 
 
 async def get_findings_by_target(host: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -3455,16 +3574,20 @@ async def get_exploitation_result(finding_id: int) -> dict[str, Any] | None:
 
 async def get_exploitation_results_map(finding_ids: list[int]) -> dict[int, dict[str, Any]]:
     """Latest exploitation result per finding id, for attaching PoCs to findings."""
-    ids = [int(fid) for fid in finding_ids if fid]
+    ids = list(dict.fromkeys(int(fid) for fid in finding_ids if fid))
     if not ids:
         return {}
-    placeholders = ",".join("?" * len(ids))
+    batch_size = 500
+    rows: list[dict[str, Any]] = []
     async with get_connection() as connection:
-        cursor = await connection.execute(
-            f"SELECT * FROM exploitation_results WHERE finding_id IN ({placeholders}) ORDER BY id ASC",
-            ids,
-        )
-        rows = [dict(row) for row in await cursor.fetchall()]
+        for start in range(0, len(ids), batch_size):
+            batch = ids[start:start + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            cursor = await connection.execute(
+                f"SELECT * FROM exploitation_results WHERE finding_id IN ({placeholders}) ORDER BY id ASC",
+                batch,
+            )
+            rows.extend(dict(row) for row in await cursor.fetchall())
     latest: dict[int, dict[str, Any]] = {}
     for row in rows:
         for col in ("tables_extracted", "extracted_data", "raw_result"):

@@ -1,6 +1,7 @@
 ﻿import { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import apiClient, { apiErrorMessage } from '../../services/api';
+import { hasElevatedAccess } from '../../utils/access';
 import AttackPlanCard, { AttackStep } from './AttackPlanCard';
 
 interface AttackPlan {
@@ -33,12 +34,12 @@ export default function AttackPlanner() {
   const [error, setError] = useState('');
   const [activePhase, setActivePhase] = useState<string>('all');
 
-  if (!user || (user.role !== 'admin' && !user.enterpriseId)) {
+  if (!hasElevatedAccess(user)) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="text-center p-8 border-2 border-red-500 rounded-lg">
           <h2 className="text-2xl font-bold text-red-600">Admin Access Required</h2>
-          <p className="text-gray-600 mt-2">Please log in as admin to access the Attack Planner.</p>
+          <p className="text-gray-600 mt-2">Please log in as admin or enterprise owner to access the Attack Planner.</p>
         </div>
       </div>
     );

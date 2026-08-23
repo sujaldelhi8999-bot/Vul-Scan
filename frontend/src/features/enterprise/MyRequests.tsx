@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ClipboardList, Plus, RefreshCw } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import toast from 'react-hot-toast';
 
 import { Button, EmptyState, Input, Panel, PanelSkeleton, Select, StatusBadge } from '../../components/ui/Primitives';
-import apiClient, { apiErrorMessage } from '../../services/api';
+import apiClient, { apiErrorMessage, getFindings } from '../../services/api';
+import type { Finding } from '../../types';
 import { storeEnterpriseApproval, type EnterpriseApprovalHandoff } from './approvalHandoff';
 
 interface RequestItem {
@@ -45,10 +46,38 @@ const REQUEST_LABELS: Record<string, string> = {
   remediation: 'Remediation change',
 };
 
+const STATUS_HELP: Record<string, string> = {
+  pending: 'Waiting for enterprise owner approval',
+  approved: 'Approved by owner and ready to use',
+  rejected: 'Rejected by owner',
+  started: 'Approved work has started',
+  completed: 'Approved work is complete',
+  cancelled: 'Request was cancelled',
+};
+
+function formatDate(value: string | null) {
+  return value ? new Date(value).toLocaleString() : null;
+}
+
+function formatExecutionResult(value: string | null) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    return Object.entries(parsed)
+      .map(([key, entry]) => `${key.replace(/_/g, ' ')}: ${String(entry)}`)
+      .join(' · ');
+  } catch {
+    return value;
+  }
+}
+
 export default function MyRequests() {
   const navigate = useNavigate();
+  const mountedRef = useRef(false);
   const [items, setItems] = useState<RequestItem[]>([]);
+  const [findings, setFindings] = useState<Finding[]>([]);
   const [loading, setLoading] = useState(true);
+  const [findingsLoading, setFindingsLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<RequestForm>(EMPTY_FORM);
@@ -56,15 +85,39 @@ export default function MyRequests() {
   const load = useCallback(async () => {
     try {
       const res = await apiClient.get<RequestItem[]>('/api/enterprise/requests');
+      if (!mountedRef.current) return;
       setItems(res.data);
     } catch (err) {
+      if (!mountedRef.current) return;
       toast.error(apiErrorMessage(err, 'Failed to load your requests'));
     } finally {
+      if (!mountedRef.current) return;
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  const loadFindings = useCallback(async () => {
+    try {
+      const data = await getFindings();
+      if (!mountedRef.current) return;
+      setFindings(data);
+    } catch (err) {
+      if (!mountedRef.current) return;
+      toast.error(apiErrorMessage(err, 'Failed to load findings'));
+    } finally {
+      if (!mountedRef.current) return;
+      setFindingsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    void load();
+    void loadFindings();
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [load, loadFindings]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -98,12 +151,15 @@ export default function MyRequests() {
         details,
       });
       toast.success('Request submitted for approval');
+      if (!mountedRef.current) return;
       setForm(EMPTY_FORM);
       setShowForm(false);
       void load();
     } catch (err) {
+      if (!mountedRef.current) return;
       toast.error(apiErrorMessage(err, 'Failed to submit request'));
     } finally {
+      if (!mountedRef.current) return;
       setSubmitting(false);
     }
   };
@@ -149,7 +205,14 @@ export default function MyRequests() {
         {showForm ? (
           <form onSubmit={submit} className="space-y-2.5 border-t border-[var(--border-light)] p-3.5">
             <div className="grid gap-2 sm:grid-cols-3">
-              <Input type="number" min="1" required value={form.finding_id} onChange={(event) => setForm({ ...form, finding_id: event.target.value })} placeholder="Finding ID" aria-label="Finding ID" />
+              <Select required value={form.finding_id} onChange={(event) => setForm({ ...form, finding_id: event.target.value })} aria-label="Finding">
+                <option value="">{findingsLoading ? 'Loading findings...' : 'Select a finding'}</option>
+                {findings.map((finding) => (
+                  <option key={finding.id} value={finding.id}>
+                    #{finding.id} · {finding.severity} · {finding.title}
+                  </option>
+                ))}
+              </Select>
               <Select value={form.change_type} onChange={(event) => setForm({ ...form, change_type: event.target.value })} aria-label="Change type">
                 <option value="manual">Manual action</option>
                 <option value="text_update">Text or configuration update</option>
@@ -184,20 +247,27 @@ export default function MyRequests() {
               </div>
             ) : null}
             <div className="flex justify-end">
-              <Button type="submit" variant="primary" disabled={submitting}>
+              <Button type="submit" variant="primary" disabled={submitting || findingsLoading || findings.length === 0}>
                 {submitting ? 'Submitting...' : 'Submit for Approval'}
               </Button>
             </div>
+            {!findingsLoading && findings.length === 0 ? (
+              <div className="text-[11px] text-[var(--text-muted)]">No enterprise findings are available for requests yet.</div>
+            ) : null}
           </form>
         ) : null}
 
         {items.length === 0 ? (
           <div className="border-t border-[var(--border-light)] p-2">
-            <EmptyState title="No requests yet" description="Submit a proposed finding change when remediation needs review." compact />
+            <EmptyState title="No requests yet" description="Submit a proposed finding change and track owner approval status here." compact />
           </div>
         ) : (
           <div className="divide-y divide-[var(--border-light)] border-t border-[var(--border-light)]">
             {items.map((item) => {
+              const decidedAt = formatDate(item.decided_at);
+              const startedAt = formatDate(item.started_at);
+              const completedAt = formatDate(item.completed_at);
+              const executionResult = formatExecutionResult(item.execution_result);
               return (
                 <div key={item.id} className="flex flex-wrap items-start justify-between gap-3 px-3.5 py-3">
                   <div className="min-w-0 flex-1">
@@ -206,13 +276,19 @@ export default function MyRequests() {
                       <StatusBadge status={item.status} />
                       <span className="text-[10px] uppercase tracking-wide text-[var(--text-subtle)]">{item.urgency}</span>
                     </div>
+                    <div className="mt-1 text-[11px] font-medium text-[var(--text-muted)]">
+                      {STATUS_HELP[item.status] ?? item.status}
+                    </div>
                     <div className="mt-1 text-[11px] text-[var(--text-muted)]">
                       Requested {new Date(item.created_at).toLocaleString()}
-                      {item.decided_at ? ` · Decided ${new Date(item.decided_at).toLocaleString()}` : ''}
+                      {decidedAt ? ` · Decided ${decidedAt}` : ''}
+                      {startedAt ? ` · Started ${startedAt}` : ''}
+                      {completedAt ? ` · Completed ${completedAt}` : ''}
                     </div>
                     <div className="mt-0.5 text-[11px] text-[var(--text-subtle)]">Finding #{String(item.details.finding_id ?? '')} · {String(item.details.change_type ?? 'manual').replace(/_/g, ' ')}</div>
                     {item.details.proposed_change ? <div className="mt-1 text-[11px] text-[var(--text-muted)]">{String(item.details.proposed_change)}</div> : null}
-                    {item.comment ? <div className="mt-1 text-[11px] text-[var(--text-muted)]">Comment: {item.comment}</div> : null}
+                    {item.comment ? <div className="mt-1 text-[11px] text-[var(--text-muted)]">Owner comment: {item.comment}</div> : null}
+                    {executionResult ? <div className="mt-1 text-[11px] text-[var(--text-muted)]">Result: {executionResult}</div> : null}
                   </div>
                    {item.status === 'approved' && item.details.change_type === 'code_patch' ? (
                      <Button variant="primary" onClick={() => void startApproved(item.id)}>Apply Patch</Button>

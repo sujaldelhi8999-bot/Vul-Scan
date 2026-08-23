@@ -177,7 +177,7 @@ const statusStyle = (status: string) => {
   const n = status.toLowerCase();
   const ok = n.includes('complete') || n.includes('connected') || n.includes('verified') || n.includes('healthy') || n === 'pass' || n === 'live' || n === 'resolved' || n === 'fix_verified';
   const active = n.includes('running') || n.includes('active') || n.includes('queued') || n.includes('progress') || n.includes('starting') || n.includes('pending') || n === 'open' || n === 'in_progress';
-  const err = n.includes('cancel') || n.includes('error') || n.includes('failed') || n.includes('critical') || n.includes('blocked') || n === 'false_positive' || n === 'issue_still_present';
+  const err = n.includes('cancel') || n.includes('error') || n.includes('failed') || n.includes('timeout') || n.includes('timed_out') || n.includes('timed out') || n.includes('critical') || n.includes('blocked') || n === 'false_positive' || n === 'issue_still_present';
   const warn = n.includes('attention') || n.includes('degraded') || n.includes('warning') || n.includes('na') || n.includes('expired') || n.includes('revoked');
   if (ok) return 'bg-[var(--success-soft)] text-[var(--success)]';
   if (active) return 'bg-[var(--brand-soft)] text-[var(--brand)]';

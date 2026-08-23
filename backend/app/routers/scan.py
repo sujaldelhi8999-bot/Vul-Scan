@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -26,6 +26,7 @@ from app.models import (
     ScanRequest,
     ScanResponse,
     StopScanResponse,
+    TestModule,
 )
 from app.services.authorization import TargetAuthorizationService, TargetValidationError
 from app.services.jobs import ScanCapacityError, ScanNotRunningError, scan_job_manager
@@ -40,6 +41,7 @@ router = APIRouter(prefix="/api/scan", tags=["scan"])
 settings = get_settings()
 authorization_service = TargetAuthorizationService()
 scan_policy = ScanPolicy(authorization_service)
+VALID_TEST_MODULES = set(get_args(TestModule))
 
 
 def _selected_tests(value: Any) -> list[str]:
@@ -50,12 +52,23 @@ def _selected_tests(value: Any) -> list[str]:
             return []
     if not isinstance(value, list):
         return []
-    return [str(item) for item in value]
+    return [
+        item
+        for item in (str(item) for item in value)
+        if item in VALID_TEST_MODULES
+    ]
+
+
+def _int_or_default(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _scan_response(row: dict[str, Any], findings: list[dict[str, Any]]) -> ScanResponse:
     return ScanResponse(
-        scan_id=int(row["id"]),
+        scan_id=_int_or_default(row.get("id")),
         target_url=str(row["target_url"]),
         mode=row["mode"],
         intensity=row["intensity"],
@@ -64,8 +77,8 @@ def _scan_response(row: dict[str, Any], findings: list[dict[str, Any]]) -> ScanR
         authorization_id=row.get("authorization_id"),
         authorization_confirmed=bool(row.get("authorization_confirmed")),
         status=row["status"],
-        progress=int(row["progress"]),
-        request_count=int(row["request_count"]),
+        progress=_int_or_default(row.get("progress")),
+        request_count=_int_or_default(row.get("request_count")),
         sandbox_id=row.get("sandbox_id"),
         error_message=row.get("error_message"),
         created_at=row["created_at"],

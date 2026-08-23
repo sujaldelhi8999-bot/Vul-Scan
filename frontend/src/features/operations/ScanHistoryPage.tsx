@@ -2,11 +2,11 @@ import { Link } from 'react-router-dom';
 import { useNavigate } from 'react-router-dom';
 import { Button, DataTable, EmptyState, ModeBadge, Page, PageHeader, Panel, StatusBadge } from '../../components/ui/Primitives';
 import { usePhantomData } from '../../hooks/usePhantomData';
-import { countBySeverity, formatDateTime, scanDuration, targetName } from '../../utils/derived';
+import { formatDateTime, scanDuration, targetName } from '../../utils/derived';
 
 export default function ScanHistoryPage() {
   const navigate = useNavigate();
-  const { scans, findings } = usePhantomData();
+  const { scans } = usePhantomData();
   const columns = [
     { key: 'target', label: 'Target' },
     { key: 'mode', label: 'Mode', width: '80px' },
@@ -16,8 +16,8 @@ export default function ScanHistoryPage() {
     { key: 'status', label: 'Status', width: '100px' },
   ];
   const rows = scans.map((scan) => {
-    const scanFindings = findings.filter((f) => f.scan_id === scan.id);
-    const counts = countBySeverity(scanFindings);
+    const criticalCount = scan.critical_findings_count ?? 0;
+    const highCount = scan.high_findings_count ?? 0;
     return {
       id: scan.id,
       cells: {
@@ -27,10 +27,10 @@ export default function ScanHistoryPage() {
         duration: <span className="text-xs text-[var(--text-muted)]">{scanDuration(scan)}</span>,
         findings: (
           <span className="text-xs text-[var(--text-default)]">
-            {scanFindings.length}
-            {counts.CRITICAL > 0 || counts.HIGH > 0 ? (
+            {scan.findings_count ?? 0}
+            {criticalCount > 0 || highCount > 0 ? (
               <span className="ml-1 text-[10px] text-[var(--danger)]">
-                ({counts.CRITICAL > 0 ? `C:${counts.CRITICAL}` : ''}{counts.CRITICAL > 0 && counts.HIGH > 0 ? ' ' : ''}{counts.HIGH > 0 ? `H:${counts.HIGH}` : ''})
+                ({criticalCount > 0 ? `C:${criticalCount}` : ''}{criticalCount > 0 && highCount > 0 ? ' ' : ''}{highCount > 0 ? `H:${highCount}` : ''})
               </span>
             ) : null}
           </span>

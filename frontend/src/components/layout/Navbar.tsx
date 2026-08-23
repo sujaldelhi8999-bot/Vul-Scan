@@ -1,5 +1,6 @@
 import { NavLink } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
+import { displayRole, hasElevatedAccess } from '../../utils/access';
 
 const baseClass = 'px-4 py-2 text-sm font-medium rounded-lg transition-colors';
 const activeClass = 'bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300';
@@ -7,6 +8,7 @@ const inactiveClass = 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark
 
 export default function Navbar() {
   const { user } = useAuth();
+  const elevated = hasElevatedAccess(user);
 
   return (
     <nav className="border-b border-gray-200 dark:border-gray-800 bg-white/50 dark:bg-gray-950/50 backdrop-blur-sm">
@@ -33,13 +35,13 @@ export default function Navbar() {
           Authorized Testing
         </NavLink>
 
-        {(user?.role === 'admin' || user?.enterpriseId) && (
+        {elevated && (
           <NavLink to="/intelligence" className={({ isActive }) => `${baseClass} ${isActive ? activeClass : inactiveClass}`}>
             Attack Intelligence
           </NavLink>
         )}
 
-        {(user?.role === 'admin' || user?.enterpriseId) && (
+        {elevated && (
           <NavLink to="/quality" className={({ isActive }) => `${baseClass} ${isActive ? activeClass : inactiveClass}`}>
             Scan Quality
           </NavLink>
@@ -54,7 +56,7 @@ export default function Navbar() {
             <span className="h-2 w-2 rounded-full bg-green-500" />
             Online
           </span>
-          <span>{user?.enterpriseId ? 'Enterprise Admin' : user?.role === 'admin' ? 'Admin' : 'User'}</span>
+          <span>{displayRole(user)}</span>
         </div>
       </div>
     </nav>

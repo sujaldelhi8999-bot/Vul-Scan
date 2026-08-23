@@ -49,11 +49,13 @@ def enterprise_role(user: dict[str, Any]) -> str | None:
 
 
 def can_manage_members(user: dict[str, Any]) -> bool:
-    return is_enterprise_member(user) and enterprise_role(user) == "owner"
+    return (user.get("role") == "admin" and not is_enterprise_member(user)) or (
+        is_enterprise_member(user) and enterprise_role(user) == "owner"
+    )
 
 
 def can_approve_requests(user: dict[str, Any]) -> bool:
-    return is_enterprise_member(user)
+    return can_manage_members(user)
 
 
 def can_request_audit(user: dict[str, Any]) -> bool:
@@ -86,9 +88,9 @@ def is_platform_admin(user: dict[str, Any]) -> bool:
 
 
 def has_product_admin_access(user: dict[str, Any]) -> bool:
-    """Grant product features to platform admins and active Enterprise members."""
+    """Grant elevated product features to platform admins and enterprise owners."""
 
-    return user.get("role") == "admin" or is_enterprise_member(user)
+    return can_manage_members(user)
 
 
 async def require_scan_access(scan_id: int, user: dict[str, Any]) -> dict[str, Any]:

@@ -15,6 +15,7 @@ import toast from 'react-hot-toast';
 import { useAuth } from '../../context/AuthContext';
 import apiClient, { apiErrorMessage, listGitHubRepos } from '../../services/api';
 import type { GitHubRepo } from '../../types';
+import { hasElevatedAccess } from '../../utils/access';
 import {
   Button,
   EmptyState,
@@ -69,6 +70,7 @@ interface SastScan {
 }
 
 const TERMINAL = new Set(['complete', 'error', 'cancelled']);
+const ACTIVE_REPO_ANALYSIS_KEY = 'vulscan:active-github-repo-analysis';
 
 const toolLabels: Record<string, string> = {
   semgrep: 'Static Analysis',
@@ -107,6 +109,44 @@ const DEPTH_PRESETS: Record<string, { excludes: string[]; timeout: number; label
   },
 };
 
+function isTerminalStatus(status?: string | null) {
+  return status ? TERMINAL.has(status) : false;
+}
+
+function persistScanReference(scan: SastScan, branch?: string) {
+  localStorage.setItem(ACTIVE_REPO_ANALYSIS_KEY, JSON.stringify({
+    scan_id: scan.scan_id,
+    repo_url: scan.repo_url,
+    branch,
+    overall_status: scan.overall_status,
+    overall_progress: scan.overall_progress,
+    total_findings: scan.total_findings,
+  }));
+}
+
+function restoreScanReference(): (SastScan & { branch?: string }) | null {
+  const stored = localStorage.getItem(ACTIVE_REPO_ANALYSIS_KEY);
+  if (!stored) return null;
+  try {
+    const parsed = JSON.parse(stored) as Partial<SastScan> & { branch?: string };
+    if (typeof parsed.scan_id !== 'number') return null;
+    return {
+      scan_id: parsed.scan_id,
+      repo_url: String(parsed.repo_url ?? ''),
+      branch: parsed.branch,
+      overall_status: String(parsed.overall_status ?? 'queued'),
+      overall_progress: typeof parsed.overall_progress === 'number' ? parsed.overall_progress : 0,
+      total_findings: typeof parsed.total_findings === 'number' ? parsed.total_findings : 0,
+      findings_by_severity: {},
+      sources: [],
+      findings: [],
+    };
+  } catch {
+    localStorage.removeItem(ACTIVE_REPO_ANALYSIS_KEY);
+    return null;
+  }
+}
+
 export default function CodeAnalysis() {
   const { user } = useAuth();
   const [repoUrl, setRepoUrl] = useState('');
@@ -129,11 +169,34 @@ export default function CodeAnalysis() {
   }, []);
 
   useEffect(() => {
+    const restored = restoreScanReference();
+    if (!restored) return;
+    let cancelled = false;
+
+    setScan(restored);
+    if (restored.repo_url) setRepoUrl(restored.repo_url);
+    if (restored.branch) setBranch(restored.branch);
+    setPolling(!isTerminalStatus(restored.overall_status));
+
+    apiClient.get<SastScan>(`/api/sast/${restored.scan_id}`)
+      .then((response) => {
+        if (cancelled) return;
+        setScan(response.data);
+        persistScanReference(response.data, restored.branch);
+        setPolling(!isTerminalStatus(response.data.overall_status));
+      })
+      .catch(() => {
+        if (!cancelled) setPolling(!isTerminalStatus(restored.overall_status));
+      });
+
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
     if (approval?.target_url && !repoUrl) setRepoUrl(approval.target_url);
   }, [approval, repoUrl]);
 
-  // Load the connected GitHub account's repos so they can be picked directly
-  // (same integration the Multi-Source page uses).
+  // Load the connected GitHub account's repos so they can be picked directly.
   useEffect(() => {
     let cancelled = false;
     listGitHubRepos()
@@ -179,15 +242,15 @@ export default function CodeAnalysis() {
           repo_url: url,
           branch: branch.trim() || 'main',
           exclude_patterns: preset.excludes.join(','),
-           scan_timeout: preset.timeout,
-           approval_request_id: approval?.id,
-         },
-       });
+          scan_timeout: preset.timeout,
+          approval_request_id: approval?.id,
+        },
+      });
       if (approval) {
         clearEnterpriseApproval();
         setApproval(null);
       }
-      setScan({
+      const nextScan: SastScan = {
         scan_id: response.data.scan_id,
         repo_url: url,
         overall_status: 'queued',
@@ -196,11 +259,13 @@ export default function CodeAnalysis() {
         findings_by_severity: {},
         sources: [],
         findings: [],
-      });
-      toast.success('Repository scan started');
+      };
+      setScan(nextScan);
+      persistScanReference(nextScan, branch.trim() || 'main');
+      toast.success('GitHub repo analysis started');
       setPolling(true);
     } catch (err) {
-      const msg = apiErrorMessage(err, 'Failed to start repository scan');
+      const msg = apiErrorMessage(err, 'Failed to start GitHub repo analysis');
       setError(msg);
       toast.error(msg);
     } finally {
@@ -217,7 +282,8 @@ export default function CodeAnalysis() {
         const response = await apiClient.get<SastScan>(`/api/sast/${scan.scan_id}`);
         if (cancelled) return;
         setScan((prev) => (prev ? { ...prev, ...response.data } : response.data));
-        if (TERMINAL.has(response.data.overall_status)) {
+        persistScanReference(response.data, branch.trim() || 'main');
+        if (isTerminalStatus(response.data.overall_status)) {
           setPolling(false);
           if (response.data.overall_status === 'complete') {
             toast.success(`Scan complete — ${response.data.total_findings} findings`);
@@ -239,18 +305,18 @@ export default function CodeAnalysis() {
       cancelled = true;
       if (pollTimer.current) clearInterval(pollTimer.current);
     };
-  }, [polling, scan?.scan_id]);
+  }, [branch, polling, scan?.scan_id]);
 
-  if (!user || (user.role !== 'admin' && !user.enterpriseId)) {
+  if (!hasElevatedAccess(user)) {
     return (
       <Page>
-        <PageHeader title="Code Analysis" description="Admin-only feature" />
+        <PageHeader title="GitHub Repo Analysis" description="Admin-only feature" />
         <Panel>
           <div className="flex items-center gap-3 p-6">
             <Lock className="h-5 w-5 text-red-500" />
             <div>
               <p className="text-sm font-semibold text-red-600 dark:text-red-400">Admin access required</p>
-              <p className="text-xs text-[var(--text-muted)]">Log in as admin to scan GitHub repositories.</p>
+              <p className="text-xs text-[var(--text-muted)]">Log in as admin or enterprise owner to scan GitHub repositories.</p>
             </div>
           </div>
         </Panel>
@@ -263,11 +329,22 @@ export default function CodeAnalysis() {
   return (
     <Page>
       <PageHeader
-        title="Code Analysis"
+        title="GitHub Repo Analysis"
         description="Scan a GitHub repository for secrets, insecure patterns, and vulnerable dependencies. Connected-account repos (including private) are supported."
       />
 
       <div className="space-y-5">
+        {active ? (
+          <Panel>
+            <div className="flex items-center gap-3 p-3.5 text-xs text-[var(--text-muted)]">
+              <RefreshCw className="h-3.5 w-3.5 animate-spin text-[var(--brand)]" />
+              <span>
+                GitHub repo analysis #{scan.scan_id} is running in the background. You can switch pages and start other task types while this continues.
+              </span>
+            </div>
+          </Panel>
+        ) : null}
+
         <Panel>
           <div className="p-4">
             {githubConnected ? (
@@ -327,7 +404,7 @@ export default function CodeAnalysis() {
                 {starting ? (
                   <><RefreshCw className="h-3.5 w-3.5 animate-spin" /> Starting...</>
                 ) : (
-                  <><ScanLine className="h-3.5 w-3.5" /> Scan Repository</>
+                  <><ScanLine className="h-3.5 w-3.5" /> Analyze GitHub Repo</>
                 )}
               </Button>
             </div>
@@ -338,14 +415,14 @@ export default function CodeAnalysis() {
           </div>
         </Panel>
 
-        {error ? <ErrorState title="Code analysis failed" description={error} /> : null}
+        {error ? <ErrorState title="GitHub repo analysis failed" description={error} /> : null}
 
         {!scan ? (
           <Panel>
             <EmptyState
               icon={<Code2 className="h-5 w-5" />}
-              title="No repository scanned yet"
-              description="Paste a public GitHub repository URL above (e.g. https://github.com/expressjs/express) and start a scan."
+              title="No GitHub repository analyzed yet"
+              description="Paste a public GitHub repository URL above (e.g. https://github.com/expressjs/express) and start an analysis."
             />
           </Panel>
         ) : (
@@ -460,15 +537,15 @@ export default function CodeAnalysis() {
                         key={finding.id}
                         type="button"
                         onClick={() => setExpanded(expanded === finding.id ? null : finding.id)}
-                        className="w-full rounded-xl border border-[var(--border-light)] bg-white dark:bg-gray-900 p-3 text-left transition-colors hover:border-[var(--border-strong)]"
+                        className="w-full rounded-xl border border-slate-200 bg-white p-3 text-left shadow-sm transition-colors hover:border-slate-300 hover:bg-slate-50"
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <SeverityBadge severity={finding.severity as never} />
-                              <span className="text-xs font-semibold text-[var(--text-strong)]">{finding.title}</span>
+                              <span className="text-xs font-semibold text-slate-950">{finding.title}</span>
                             </div>
-                            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-[var(--text-subtle)]">
+                            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-slate-500">
                               <span>{finding.category}</span>
                               {finding.module ? <span className="font-mono">{finding.module}</span> : null}
                               {finding.endpoint ? <span className="truncate font-mono">{finding.endpoint}</span> : null}
@@ -476,23 +553,23 @@ export default function CodeAnalysis() {
                               {finding.cvss_score != null ? <span>CVSS {finding.cvss_score}</span> : null}
                             </div>
                           </div>
-                          {finding.evidence ? <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-[var(--text-subtle)]" /> : null}
+                          {finding.evidence ? <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-slate-400" /> : null}
                         </div>
 
                         {expanded === finding.id ? (
-                          <div className="mt-3 space-y-2 border-t border-[var(--border-light)] pt-3">
+                          <div className="mt-3 space-y-2 border-t border-slate-200 pt-3">
                             {finding.evidence ? (
-                              <pre className="overflow-x-auto rounded-lg bg-[var(--surface-tertiary)] p-3 font-mono text-[11px] leading-relaxed text-[var(--text-default)]">
+                              <pre className="overflow-x-auto rounded-lg bg-slate-50 p-3 font-mono text-[11px] leading-relaxed text-slate-800">
                                 {finding.evidence}
                               </pre>
                             ) : null}
                             {finding.impact ? (
-                              <p className="text-[11px] text-[var(--text-muted)]">
+                              <p className="text-[11px] text-slate-600">
                                 <span className="font-semibold">Impact:</span> {finding.impact}
                               </p>
                             ) : null}
                             {(finding.recommendation || finding.recommended_fix) ? (
-                              <p className="text-[11px] text-[var(--text-muted)]">
+                              <p className="text-[11px] text-slate-600">
                                 <span className="font-semibold">Fix:</span> {finding.recommendation || finding.recommended_fix}
                               </p>
                             ) : null}

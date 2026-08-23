@@ -7,19 +7,18 @@ import EmployeeManagement from './EmployeeManagement';
 import ApprovalWorkflow from './ApprovalWorkflow';
 import AuditLogs from './AuditLogs';
 import MyRequests from './MyRequests';
-import Notifications from './Notifications';
 import EnterpriseSettings from './EnterpriseSettings';
+import { isEnterpriseOwner } from '../../utils/access';
 
-type Tab = 'requests' | 'notifications' | 'employees' | 'approvals' | 'audit' | 'settings';
+type Tab = 'requests' | 'employees' | 'approvals' | 'audit' | 'settings';
 
 const USER_TABS: Array<{ id: Tab; label: string }> = [
   { id: 'requests', label: 'My Requests' },
-  { id: 'notifications', label: 'Notifications' },
-  { id: 'approvals', label: 'Approvals' },
-  { id: 'audit', label: 'Audit Logs' },
 ];
 
 const OWNER_TABS: Array<{ id: Tab; label: string }> = [
+  { id: 'approvals', label: 'Approvals' },
+  { id: 'audit', label: 'Audit Logs' },
   { id: 'employees', label: 'Employees' },
   { id: 'settings', label: 'Settings' },
 ];
@@ -39,14 +38,14 @@ export default function EnterpriseDashboard() {
     );
   }
 
-  const isOwner = user.enterpriseRole === 'owner';
+  const isOwner = isEnterpriseOwner(user);
   const tabs = isOwner ? [...USER_TABS, ...OWNER_TABS] : USER_TABS;
 
   return (
     <Page>
         <PageHeader
         title="Enterprise Workspace"
-        description={isOwner ? 'Manage the organization and review team remediation changes.' : 'Scan freely and review team remediation changes.'}
+        description={isOwner ? 'Manage employees, organization settings, and remediation approvals.' : 'Track your enterprise approval requests and status.'}
         action={<Building2 className="h-4 w-4 text-[var(--text-subtle)]" />}
       />
 
@@ -66,12 +65,11 @@ export default function EnterpriseDashboard() {
         ))}
       </div>
 
-      {tab === 'requests' && <MyRequests />}
-      {tab === 'notifications' && <Notifications />}
-       {tab === 'employees' && isOwner && <EmployeeManagement />}
-       {tab === 'approvals' && <ApprovalWorkflow />}
-       {tab === 'audit' && <AuditLogs />}
-       {tab === 'settings' && isOwner && <EnterpriseSettings />}
+        {tab === 'requests' && <MyRequests />}
+        {tab === 'employees' && isOwner && <EmployeeManagement />}
+        {tab === 'approvals' && isOwner && <ApprovalWorkflow />}
+        {tab === 'audit' && isOwner && <AuditLogs />}
+        {tab === 'settings' && isOwner && <EnterpriseSettings />}
     </Page>
   );
 }

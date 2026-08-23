@@ -139,7 +139,7 @@ export default function LiveScanPage() {
     <Page>
       <PageHeader
         title={mode === 'pentest' ? 'Pentest Scan' : 'Defend Scan'}
-        description={activeScan ? `Scanning ${targetName(activeScan.target_url)}` : mode === 'pentest' ? 'Run active assessments with optional exploit verification against targets.' : 'Run passive security assessments against targets.'}
+        description={activeScan ? `Scanning ${targetName(activeScan.target_url)}. This task continues in the background while you use other pages.` : mode === 'pentest' ? 'Run active assessments with optional exploit verification against targets.' : 'Run passive security assessments against targets.'}
         action={
           activeScan ? (
             <div className="flex gap-2">

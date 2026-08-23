@@ -72,7 +72,7 @@ export default function ApprovalWorkflow() {
           <EmptyState
             icon={<CheckCircle2 className="h-5 w-5" />}
             title="No pending approvals"
-            description="Employee requests will appear here for review."
+            description="Team requests will appear here for review."
             compact
           />
         </div>

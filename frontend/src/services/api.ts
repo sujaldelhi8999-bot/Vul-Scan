@@ -26,6 +26,7 @@ import type {
   Finding,
   FindingAIExplanation,
   FindingVerificationResponse,
+  FindingsPageResponse,
   GitHubConnectResponse,
   GitHubInstallation,
   GitHubInstallationListResponse,
@@ -67,7 +68,7 @@ export const API_BASE_URL = baseUrl;
 
 // Ensure a single axios instance with interceptor
 const apiClient = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000/api',
+  baseURL: baseUrl,
 });
 
 apiClient.interceptors.request.use((config) => {
@@ -84,6 +85,28 @@ export default apiClient;
 const AUTH_ENDPOINTS = ['/api/auth/login', '/api/auth/register', '/api/auth/supabase', '/api/auth/refresh'];
 
 let refreshInFlight: Promise<boolean> | null = null;
+
+function responseDetail(error: unknown): string {
+  if (!axios.isAxiosError(error)) return '';
+  const data = error.response?.data as unknown;
+  if (typeof data === 'string') return data;
+  if (data && typeof data === 'object') {
+    const detail = (data as Record<string, unknown>).detail;
+    if (typeof detail === 'string') return detail;
+  }
+  return '';
+}
+
+function hasAuthorizationHeader(headers: unknown): boolean {
+  if (!headers || typeof headers !== 'object') return false;
+  const record = headers as Record<string, unknown>;
+  return Boolean(record.Authorization || record.authorization);
+}
+
+function attachAuthorizationHeader(config: Record<string, any>, token: string) {
+  config.headers = config.headers ?? {};
+  config.headers.Authorization = `Bearer ${token}`;
+}
 
 function persistSession(response: Awaited<ReturnType<typeof refreshToken>>) {
   localStorage.setItem('phantom_token', response.token);
@@ -145,19 +168,28 @@ apiClient.interceptors.response.use(
 
     if (status === 401 && !isAuthRequest) {
       const token = localStorage.getItem('phantom_token');
-      const expired = isTokenExpired(token);
+      const detail = responseDetail(error);
+      const config = (error.config ?? {}) as Record<string, any>;
 
-      if (expired && getStoredRefreshToken()) {
+      if (token && !hasAuthorizationHeader(config.headers) && !config.__authRetry) {
+        config.__authRetry = true;
+        attachAuthorizationHeader(config, token);
+        return apiClient(config);
+      }
+
+      const expired = isTokenExpired(token) || /expired|invalid token|user not found/i.test(detail);
+
+      if (token && expired && getStoredRefreshToken()) {
         const refreshed = await refreshSessionToken();
         if (refreshed) {
-          const config = error.config;
-          config.headers = config.headers ?? {};
-          config.headers.Authorization = `Bearer ${localStorage.getItem('phantom_token')}`;
+          attachAuthorizationHeader(config, localStorage.getItem('phantom_token') || '');
           return apiClient(config);
         }
       }
 
-      expireSession();
+      if (!token || expired) {
+        expireSession();
+      }
     }
 
     return Promise.reject(error);
@@ -323,8 +355,44 @@ export async function stopScan(id: number | string): Promise<StopScanResponse> {
   return response.data;
 }
 
-export async function getFindings(scanId?: number): Promise<Finding[]> {
-  const response = await apiClient.get<Finding[]>('/api/findings', { params: scanId ? { scan_id: scanId } : undefined });
+export async function getFindings(
+  scanId?: number,
+  options?: { limit?: number; offset?: number; includeDetails?: boolean }
+): Promise<Finding[]> {
+  const response = await apiClient.get<Finding[]>('/api/findings', {
+    params: {
+      ...(scanId ? { scan_id: scanId } : {}),
+      ...(options?.limit ? { limit: options.limit } : {}),
+      ...(options?.offset ? { offset: options.offset } : {}),
+      ...(options?.includeDetails ? { include_details: true } : {}),
+    },
+  });
+  return response.data;
+}
+
+export async function getFindingsPage(params: {
+  scanId?: number;
+  limit?: number;
+  offset?: number;
+  severity?: string;
+  category?: string;
+  q?: string;
+}): Promise<FindingsPageResponse> {
+  const response = await apiClient.get<FindingsPageResponse>('/api/findings/page', {
+    params: {
+      scan_id: params.scanId,
+      limit: params.limit,
+      offset: params.offset,
+      severity: params.severity && params.severity !== 'ALL' ? params.severity : undefined,
+      category: params.category && params.category !== 'All' ? params.category : undefined,
+      q: params.q?.trim() || undefined,
+    },
+  });
+  return response.data;
+}
+
+export async function getFinding(findingId: number): Promise<Finding> {
+  const response = await apiClient.get<Finding>(`/api/findings/${findingId}`);
   return response.data;
 }
 

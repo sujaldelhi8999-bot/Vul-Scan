@@ -53,15 +53,32 @@ def default_agent_states() -> list[dict[str, Any]]:
     ]
 
 
-def build_pentest_agent_states(current_module: str | None = None, detail: str = "") -> list[dict[str, Any]]:
+def build_pentest_agent_states(
+    lifecycle: str = "RUNNING",
+    current_module: str | None = None,
+    detail: str = "",
+) -> list[dict[str, Any]]:
     states = default_agent_states()
     now = datetime.now(timezone.utc).isoformat()
+    lifecycle = lifecycle.upper()
+    pentest_applicability = {
+        "QUEUED": "RUNNING",
+        "STARTING": "RUNNING",
+        "RUNNING": "RUNNING",
+        "PAUSED": "WAITING",
+        "COMPLETED": "IDLE",
+        "FAILED": "FAILED",
+        "CANCELLED": "IDLE",
+        "IDLE": "IDLE",
+    }.get(lifecycle, "IDLE")
     for state in states:
         name = state["name"]
         if name == "Pentest Agent":
-            state["applicability"] = "RUNNING"
-            state["current_module"] = current_module
-            state["detail"] = detail or "Executing authorized security test"
+            state["applicability"] = pentest_applicability
+            state["current_module"] = current_module if pentest_applicability == "RUNNING" else None
+            state["detail"] = detail or (
+                "Executing authorized security test" if pentest_applicability == "RUNNING" else "Idle"
+            )
             state["last_updated"] = now
         elif name in ("Sandbox Manager Agent",):
             state["applicability"] = "NOT_APPLICABLE"
@@ -170,7 +187,11 @@ async def update_authorized_test_execution(
     is_lab: bool = False,
     authorization_status: str = "",
 ) -> None:
-    agent_states = build_pentest_agent_states(current_module=current_module, detail=current_phase or "")
+    agent_states = build_pentest_agent_states(
+        lifecycle=lifecycle,
+        current_module=current_module,
+        detail=current_phase or "",
+    )
     if is_lab:
         agent_states = build_lab_agent_states()
 

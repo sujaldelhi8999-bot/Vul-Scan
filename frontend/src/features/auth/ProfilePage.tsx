@@ -2,6 +2,7 @@ import { LogOut, Mail, ShieldCheck, User as UserIcon } from 'lucide-react';
 
 import { Button, Page, PageHeader, Panel, SectionHeader } from '../../components/ui/Primitives';
 import { useAuth } from '../../context/AuthContext';
+import { displayRole, hasElevatedAccess } from '../../utils/access';
 
 export default function ProfilePage() {
   const { user, logoutUser } = useAuth();
@@ -16,11 +17,12 @@ export default function ProfilePage() {
 
   const displayName = user.name || user.username || 'User';
   const initial = displayName.charAt(0).toUpperCase();
+  const elevated = hasElevatedAccess(user);
 
   const rows: Array<[string, string]> = [
     ['Username', user.username],
     ['Email', user.email || '—'],
-    ['Role', user.enterpriseId ? 'Enterprise Admin' : user.role === 'admin' ? 'Admin' : 'User'],
+    ['Role', displayRole(user)],
   ];
 
   return (
@@ -45,15 +47,15 @@ export default function ProfilePage() {
             <div>
               <div className="text-sm font-semibold text-[var(--text-strong)]">{displayName}</div>
               <div className="mt-0.5 flex items-center justify-center gap-1.5 text-[11px] text-[var(--text-muted)]">
-                {user.role === 'admin' || user.enterpriseId ? (
+                {elevated ? (
                   <>
                     <ShieldCheck className="h-3.5 w-3.5 text-[var(--brand)]" />
-                    <span className="font-semibold text-[var(--brand)]">{user.enterpriseId ? 'Enterprise Admin' : 'Admin'}</span>
+                    <span className="font-semibold text-[var(--brand)]">{displayRole(user)}</span>
                   </>
                 ) : (
                   <>
                     <UserIcon className="h-3.5 w-3.5" />
-                    <span>User</span>
+                    <span>{displayRole(user)}</span>
                   </>
                 )}
               </div>

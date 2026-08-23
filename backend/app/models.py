@@ -516,6 +516,9 @@ class ScanHistoryItem(BaseModel):
     progress: int = Field(ge=0, le=100)
     created_at: datetime
     completed_at: datetime | None = None
+    findings_count: int = 0
+    critical_findings_count: int = 0
+    high_findings_count: int = 0
 
 
 class AuditLog(BaseModel):
@@ -829,6 +832,7 @@ class MultiSourceScanResponse(BaseModel):
     overall_status: ScanStatus
     overall_progress: int = Field(ge=0, le=100)
     sources: list[SourceScanResult] = Field(default_factory=list)
+    findings: list[dict[str, Any]] = Field(default_factory=list)
     total_findings: int = 0
     findings_by_severity: dict[Severity, int] = Field(default_factory=dict)
     correlated_findings_count: int = 0

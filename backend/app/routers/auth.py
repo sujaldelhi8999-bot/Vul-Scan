@@ -108,6 +108,7 @@ def _issue_refresh_token(settings, user_id: str) -> str:
 async def _build_login_response(settings, user: dict) -> LoginResponse:
     token = _issue_token(settings, user["id"], user["role"])
     membership = await get_enterprise_membership(user["id"])
+    can_manage = bool(membership and membership.get("enterprise_role") == "owner")
     return LoginResponse(
         token=token,
         refresh_token=_issue_refresh_token(settings, user["id"]),
@@ -126,8 +127,8 @@ async def _build_login_response(settings, user: dict) -> LoginResponse:
             max_severity="ALL" if membership else user.get("max_severity"),
             can_request_audit=True if membership else bool(user.get("can_request_audit")),
             can_request_fix=True if membership else bool(user.get("can_request_fix")),
-            can_approve=True if membership else bool(user.get("can_approve")),
-            can_manage_members=membership.get("enterprise_role") == "owner" if membership else bool(user.get("can_manage_members")),
+            can_approve=can_manage if membership else bool(user.get("can_approve")),
+            can_manage_members=can_manage if membership else bool(user.get("can_manage_members")),
             allowed_email_domains=membership.get("allowed_email_domains", []) if membership else user.get("allowed_email_domains", []),
         ),
     )
@@ -278,8 +279,8 @@ async def change_password(req: ChangePasswordRequest, user: dict = Depends(get_c
         max_severity="ALL" if membership else None,
         can_request_audit=bool(membership),
         can_request_fix=bool(membership),
-        can_approve=bool(membership),
-        can_manage_members=membership.get("enterprise_role") == "owner" if membership else False,
+        can_approve=bool(membership and membership.get("enterprise_role") == "owner"),
+        can_manage_members=bool(membership and membership.get("enterprise_role") == "owner"),
         allowed_email_domains=membership.get("allowed_email_domains", []) if membership else [],
     )
 

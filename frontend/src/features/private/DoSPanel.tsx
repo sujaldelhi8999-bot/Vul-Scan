@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { apiErrorMessage, getDosHistory, getDosStatus, startDos, stopDos } from '../../services/api';
+import { hasElevatedAccess } from '../../utils/access';
 
 interface DoSJob {
   job_id: string;
@@ -139,12 +140,12 @@ export default function DoSPanel() {
   const [notice, setNotice] = useState('');
   const [stats, setStats] = useState<LiveStats>({ requests_sent: 0, responses_received: 0, errors: 0, avg_latency: 0, error_rate: 0, jitter: 0 });
 
-  if (!user || (user.role !== 'admin' && !user.enterpriseId)) {
+  if (!hasElevatedAccess(user)) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
         <div className="text-center p-8 border-2 border-red-500 rounded-lg">
           <h2 className="text-2xl font-bold text-red-600">Admin Access Required</h2>
-          <p className="text-gray-600 mt-2">Please log in as admin to access DoS testing.</p>
+          <p className="text-gray-600 mt-2">Please log in as admin or enterprise owner to access DoS testing.</p>
         </div>
       </div>
     );

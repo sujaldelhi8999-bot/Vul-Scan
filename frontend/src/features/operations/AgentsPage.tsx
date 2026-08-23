@@ -10,7 +10,10 @@ export default function AgentsPage() {
 
   const agentDetails: AgentStateDetail[] = useMemo(() => {
     if (executionStatus?.agents && executionStatus.agents.length > 0) {
-      return executionStatus.agents;
+      return executionStatus.agents.map((agent) => ({
+        ...agent,
+        applicability: agent.applicability === 'NOT_APPLICABLE' ? 'IDLE' : agent.applicability,
+      }));
     }
     return agents.map((a) => ({
       name: a.name,
@@ -24,14 +27,13 @@ export default function AgentsPage() {
   }, [agents, executionStatus]);
 
   const summary = useMemo(() => {
-    const counts = { running: 0, queued: 0, completed: 0, failed: 0, idle: 0, na: 0 };
+    const counts = { running: 0, queued: 0, completed: 0, failed: 0, idle: 0 };
     for (const a of agentDetails) {
       if (a.applicability === 'RUNNING') counts.running++;
       else if (a.applicability === 'QUEUED' || a.applicability === 'WAITING') counts.queued++;
       else if (a.applicability === 'COMPLETED') counts.completed++;
       else if (a.applicability === 'FAILED') counts.failed++;
-      else if (a.applicability === 'IDLE') counts.idle++;
-      else if (a.applicability === 'NOT_APPLICABLE') counts.na++;
+      else counts.idle++;
     }
     return counts;
   }, [agentDetails]);
@@ -48,7 +50,7 @@ export default function AgentsPage() {
       {/* Agent summary bar */}
       <Panel>
         <SectionHeader title="Agent Summary" />
-        <div className="grid grid-cols-3 sm:grid-cols-6 divide-x divide-[var(--border-light)]">
+        <div className="grid grid-cols-2 sm:grid-cols-5 divide-x divide-[var(--border-light)]">
           <div className="px-4 py-3">
             <div className="text-[11px] font-medium text-[var(--brand)]">Running</div>
             <div className="mt-0.5 text-lg font-semibold text-[var(--text-strong)]">{summary.running}</div>
@@ -68,10 +70,6 @@ export default function AgentsPage() {
           <div className="px-4 py-3">
             <div className="text-[11px] font-medium text-[var(--text-muted)]">Idle</div>
             <div className="mt-0.5 text-lg font-semibold text-[var(--text-strong)]">{summary.idle}</div>
-          </div>
-          <div className="px-4 py-3">
-            <div className="text-[11px] font-medium text-[var(--text-subtle)]">N/A</div>
-            <div className="mt-0.5 text-lg font-semibold text-[var(--text-strong)]">{summary.na}</div>
           </div>
         </div>
       </Panel>

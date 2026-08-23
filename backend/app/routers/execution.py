@@ -11,6 +11,20 @@ from app.services.execution_status import default_agent_states
 logger = logging.getLogger("phantomscan.execution")
 
 router = APIRouter(prefix="/api/execution", tags=["execution"])
+TERMINAL_LIFECYCLES = {"COMPLETED", "FAILED", "CANCELLED", "IDLE"}
+
+
+def _normalize_agent_states(lifecycle: str, agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if lifecycle not in TERMINAL_LIFECYCLES:
+        return agents
+    normalized = []
+    for agent in agents:
+        item = dict(agent)
+        if item.get("applicability") in {"QUEUED", "RUNNING", "WAITING"}:
+            item["applicability"] = "IDLE" if lifecycle in {"COMPLETED", "CANCELLED", "IDLE"} else "FAILED"
+            item["current_module"] = None
+        normalized.append(item)
+    return normalized
 
 
 @router.get("/status", response_model=ExecutionStatusResponse)
@@ -21,10 +35,11 @@ async def execution_status(user: dict = Depends(get_current_user)) -> ExecutionS
             lifecycle="IDLE",
             agents=[AgentStateDetail(**a) for a in default_agent_states()],
         )
-    agents = status.get("agent_states", [])
+    lifecycle = status.get("lifecycle", "IDLE")
+    agents = _normalize_agent_states(lifecycle, status.get("agent_states", []))
     return ExecutionStatusResponse(
         execution_type=status.get("execution_type"),
-        lifecycle=status.get("lifecycle", "IDLE"),
+        lifecycle=lifecycle,
         job_id=status.get("job_id"),
         scan_id=status.get("scan_id"),
         target_url=status.get("target_url", ""),
