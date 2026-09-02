@@ -77,6 +77,7 @@ class Finding(Base):
     exploited: Mapped[bool] = mapped_column(default=False, nullable=False)
     exploitation_result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     poc: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    source_correlation: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     sources: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     correlation: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     primary_source: Mapped[str] = mapped_column(String(32), default="live", nullable=False)

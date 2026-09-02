@@ -1,11 +1,7 @@
 import asyncio
 import os
-import tempfile
 from unittest import IsolatedAsyncioTestCase
 
-_db_fd, _db_path = tempfile.mkstemp(suffix=".sqlite3")
-os.close(_db_fd)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 os.environ.setdefault("MAX_REQUESTS_PER_SECOND", "3.0")
 
 from app.models import ScanRequest  # noqa: E402

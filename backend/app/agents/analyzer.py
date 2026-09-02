@@ -4,6 +4,7 @@ import random
 import re
 import ssl
 import string
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -148,7 +149,7 @@ class AnalyzerAgent(Agent):
 
         if page is not None:
             try:
-                findings.extend(await self._check_tls(target_url))
+                findings.extend(await self._check_tls(str(page["final_url"])))
             except Exception:
                 logger.exception("Failed to check TLS for %s", target_url)
                 raise
@@ -221,6 +222,7 @@ class AnalyzerAgent(Agent):
 
     def _check_headers(self, headers: dict[str, str], target: str) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
+        headers = self._lower_headers(headers)
 
         def sev_for(finding_type: str) -> str:
             return calculate_severity(finding_type, {"url": target}).lower()
@@ -283,13 +285,6 @@ class AnalyzerAgent(Agent):
                     "Short max-age weakens protection against SSL stripping",
                     f"Set max-age to at least {HSTS_MIN_MAX_AGE}", target
                 ))
-            if "preload" not in hsts:
-                findings.append(self._finding(
-                    "HSTS missing preload directive", "Security Headers", "low",
-                    "No preload flag in HSTS", "Browser won't preload HSTS",
-                    "Add 'preload' to HSTS header and submit to hstspreload.org", target
-                ))
-
         if "x-frame-options" not in present and "frame-ancestors" not in headers.get("content-security-policy", ""):
             findings.append(self._finding(
                 "Missing Clickjacking Protection", "Security Headers", sev_for("missing_xfo"),
@@ -474,26 +469,36 @@ class AnalyzerAgent(Agent):
 
     async def _check_tls(self, target_url: str) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
-        host = target_url.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+        parsed = urlparse(target_url if "://" in target_url else f"https://{target_url}")
+        if parsed.scheme != "https":
+            return findings
+        host = parsed.hostname or parsed.netloc.split(":")[0]
+        port = parsed.port or 443
 
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
         try:
             r, w = await asyncio.wait_for(
-                asyncio.open_connection(host, 443, ssl=ctx), timeout=5.0
+                asyncio.open_connection(host, port, ssl=ctx, server_hostname=host), timeout=5.0
             )
             cert = w.get_extra_info("ssl_object").getpeercert()
-            ver = w.get_extra_info("ssl_object").version()
             cipher = w.get_extra_info("ssl_object").cipher()
             w.close()
             await w.wait_closed()
 
-            if ver in ("TLSv1", "TLSv1.0", "TLSv1.1"):
+            if await self._probe_tls_version(host, port, ssl.TLSVersion.TLSv1):
                 findings.append(self._finding(
-                    f"Outdated TLS version: {ver}", "TLS", "high",
-                    f"Server uses {ver}", "Deprecated TLS allows downgrade attacks",
+                    "Legacy TLS 1.0 supported", "TLS", "high",
+                    "Server accepted a TLS 1.0 handshake", "Deprecated TLS allows downgrade attacks",
+                    "Disable TLS 1.0 and 1.1; use TLS 1.2+", target_url
+                ))
+            if await self._probe_tls_version(host, port, ssl.TLSVersion.TLSv1_1):
+                findings.append(self._finding(
+                    "Legacy TLS 1.1 supported", "TLS", "high",
+                    "Server accepted a TLS 1.1 handshake", "Deprecated TLS allows downgrade attacks",
                     "Disable TLS 1.0 and 1.1; use TLS 1.2+", target_url
                 ))
 
@@ -523,32 +528,41 @@ class AnalyzerAgent(Agent):
                         "Use a trusted CA-signed certificate", target_url
                     ))
 
-                hsts_h = None
-                async with build_http_client(timeout=5.0) as c:
-                    try:
-                        r = await c.get(f"https://{host}")
-                        hsts_h = r.headers.get("strict-transport-security", "")
-                    except Exception as e:
-                        logger.debug("HSTS preload check failed for %s: %s", host, e)
-
-                if hsts_h and "preload" in hsts_h:
-                    findings.append(self._finding(
-                        "HSTS preload eligible", "TLS", "info",
-                        "HSTS includes preload", "Ready for preload list submission",
-                        "Submit to https://hstspreload.org", target_url
-                    ))
         except Exception as e:
-            logger.warning("TLS connection check failed for %s:443: %s", host, e)
+            logger.warning("TLS connection check failed for %s:%d: %s", host, port, e)
             findings.append(self._finding(
                 "Could not establish TLS connection", "TLS", "low",
-                f"Failed to connect to {host}:443", "TLS may not be available",
+                f"Failed to connect to {host}:{port}", "TLS may not be available",
                 "Ensure HTTPS is properly configured", target_url
             ))
 
         return findings
 
+    async def _probe_tls_version(self, host: str, port: int, version: ssl.TLSVersion) -> bool:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            context.minimum_version = version
+            context.maximum_version = version
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=context, server_hostname=host),
+                timeout=3.0,
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
     def _check_info_leakage(self, headers: dict[str, str]) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
+        headers = self._lower_headers(headers)
         leaky = {
             "server": "Server version disclosure",
             "x-powered-by": "X-Powered-By disclosure",
@@ -568,6 +582,10 @@ class AnalyzerAgent(Agent):
                 ))
 
         return findings
+
+    @staticmethod
+    def _lower_headers(headers: Any) -> dict[str, str]:
+        return {str(k).lower(): str(v) for k, v in dict(headers).items()}
 
     async def _verify_trace_method(self, client, url: str, target_url: str) -> dict[str, Any] | None:
         try:

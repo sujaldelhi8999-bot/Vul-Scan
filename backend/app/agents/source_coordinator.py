@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -97,40 +98,40 @@ class SourceCoordinatorAgent(Agent):
 
         # Phase 1: Run SAST on code sources (parallel)
         if sast_sources:
-            await update_scan_progress(scan_id, 10, f"Starting SAST on {len(sast_sources)} code sources")
+            await update_scan_progress(scan_id, 10)
             await self.log_action("sast_phase_started", f"Starting SAST on {len(sast_sources)} code sources")
             sast_results = await self._run_sast_sources(sast_sources, scan_id, user_id)
             source_results.extend(sast_results)
             total_findings += sum(self._result_findings(r) for r in sast_results)
-            await update_scan_progress(scan_id, 40, f"SAST completed with {total_findings} findings")
+            await update_scan_progress(scan_id, 40)
             await self.log_action("sast_phase_completed", f"SAST completed with {total_findings} findings")
 
         # Phase 2: Run DAST on live targets (if authorized)
         if live_sources:
-            await update_scan_progress(scan_id, 45, f"Starting DAST on {len(live_sources)} live targets")
+            await update_scan_progress(scan_id, 45)
             await self.log_action("dast_phase_started", f"Starting DAST on {len(live_sources)} live targets")
             dast_results = await self._run_dast_sources(live_sources, scan_id, user_id, authorization_context)
             source_results.extend(dast_results)
             total_findings += sum(self._result_findings(r) for r in dast_results)
-            await update_scan_progress(scan_id, 75, f"DAST completed with {total_findings} total findings")
+            await update_scan_progress(scan_id, 75)
             await self.log_action("dast_phase_completed", f"DAST completed with {total_findings} total findings")
 
         # Phase 3: Correlation across sources
         if scan_request.correlate_findings and source_results:
-            await update_scan_progress(scan_id, 80, "Starting cross-source correlation")
+            await update_scan_progress(scan_id, 80)
             await self.log_action("correlation_started", "Starting cross-source correlation")
             correlated_count = await self._correlate_findings(scan_id, source_results)
             await self.log_action("correlation_completed", f"Found {correlated_count} correlations")
 
         # Phase 4: Data flow tracing
         if scan_request.data_flow_tracing and source_results:
-            await update_scan_progress(scan_id, 85, "Starting data flow tracing")
+            await update_scan_progress(scan_id, 85)
             await self.log_action("dataflow_started", "Starting data flow tracing")
             await self._trace_data_flows(scan_id, source_results)
             await self.log_action("dataflow_completed", "Data flow tracing completed")
 
         # Phase 5: Calculate health score
-        await update_scan_progress(scan_id, 90, "Calculating health score")
+        await update_scan_progress(scan_id, 90)
         health_score_result = None
         try:
             from app.services.health_score import calculate_health_score
@@ -155,7 +156,7 @@ class SourceCoordinatorAgent(Agent):
         except Exception as e:
             await self.log_action("health_score_error", f"Health score calculation failed: {str(e)}")
 
-        await update_scan_progress(scan_id, 95, f"Scan complete: {total_findings} findings, {correlated_count} correlations")
+        await update_scan_progress(scan_id, 95)
         self.status = "complete"
         await self.log_action("completed", f"Multi-source scan completed: {total_findings} findings, {correlated_count} correlations")
 
@@ -211,7 +212,6 @@ class SourceCoordinatorAgent(Agent):
         await update_scan_progress(
             scan_id,
             progress_start + 2,
-            f"SAST running on {total} source(s) — pure-Python scanners active",
         )
 
         async def run_single(source) -> dict[str, Any]:
@@ -229,6 +229,16 @@ class SourceCoordinatorAgent(Agent):
                     scan_mode="sast",
                 )
                 findings = result.get("findings", [])
+                if source.type == "github":
+                    github_insights = await self._collect_github_insights(source_config)
+                    if github_insights:
+                        github_findings = self._github_insight_findings(source_config, github_insights)
+                        findings.extend(github_findings)
+                        result["findings"] = findings
+                        result["total_findings"] = len(findings)
+                        artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), dict) else {}
+                        artifacts["github_insights"] = github_insights
+                        result["artifacts"] = artifacts
                 await update_scan_source_status(
                     scan_id,
                     source.type,
@@ -269,14 +279,96 @@ class SourceCoordinatorAgent(Agent):
             completed += 1
             # Interpolate progress: 12% → 38% as sources complete
             pct = progress_start + 2 + int(progress_budget * 0.9 * completed / total)
-            n_findings = len(result.get("findings", []) or result.get("result", {}).get("findings", []))
             await update_scan_progress(
                 scan_id,
                 pct,
-                f"SAST {completed}/{total} done — {n_findings} findings so far",
             )
 
         return results
+
+    async def _collect_github_insights(self, source_config: dict[str, Any]) -> dict[str, Any] | None:
+        token = source_config.get("github_token") or source_config.get("pat_token")
+        try:
+            from app.services.github_service import get_github_service
+            github_service = get_github_service()
+            if not token and source_config.get("auth_type") == "github_app" and source_config.get("github_app_installation_id"):
+                token = await github_service.get_installation_token(int(source_config["github_app_installation_id"]))
+            if not token:
+                return {"available": False, "reason": "no GitHub token available for native security insights"}
+            owner_repo = self._parse_github_owner_repo(str(source_config.get("repo_url") or ""))
+            if not owner_repo:
+                return {"available": False, "reason": "invalid GitHub repository URL"}
+            owner, repo = owner_repo
+            branch = str(source_config.get("branch") or "main")
+            return await github_service.get_repo_security_insights(token, owner, repo, branch)
+        except Exception as exc:
+            logger.debug("GitHub insights unavailable: %s", exc, exc_info=True)
+            return {"available": False, "reason": str(exc)}
+
+    @staticmethod
+    def _parse_github_owner_repo(repo_url: str) -> tuple[str, str] | None:
+        parsed = urlparse(repo_url)
+        if parsed.netloc.lower() != "github.com":
+            return None
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
+        if len(parts) < 2:
+            return None
+        return parts[0], parts[1].removesuffix(".git")
+
+    @staticmethod
+    def _github_insight_findings(source_config: dict[str, Any], insights: dict[str, Any]) -> list[dict[str, Any]]:
+        repo_url = str(source_config.get("repo_url") or "")
+        findings: list[dict[str, Any]] = []
+        dependabot = insights.get("dependabot") if isinstance(insights.get("dependabot"), dict) else {}
+        for alert in dependabot.get("alerts", []) or []:
+            dependency = alert.get("dependency") or {}
+            advisory = alert.get("security_advisory") or {}
+            vuln = alert.get("security_vulnerability") or {}
+            package_data = dependency.get("package") if isinstance(dependency, dict) else {}
+            package = package_data.get("name", "") if isinstance(package_data, dict) else ""
+            ecosystem = package_data.get("ecosystem", "") if isinstance(package_data, dict) else ""
+            vuln_id = advisory.get("ghsa_id") or advisory.get("cve_id") or str(alert.get("number") or "")
+            cvss = advisory.get("cvss") if isinstance(advisory.get("cvss"), dict) else {}
+            findings.append({
+                "type": "sca",
+                "tool": "github-dependabot",
+                "severity": str(advisory.get("severity") or vuln.get("severity") or "medium").upper(),
+                "confidence": "CONFIRMED",
+                "confidence_score": 0.98,
+                "confidence_label": "CONFIRMED",
+                "title": f"Dependabot alert: {package or 'dependency'} ({vuln_id})",
+                "message": advisory.get("summary") or alert.get("html_url") or "GitHub Dependabot reported a vulnerable dependency.",
+                "package_name": package,
+                "ecosystem": ecosystem,
+                "vulnerability_id": vuln_id,
+                "cve_id": vuln_id[:40] if vuln_id else None,
+                "cvss_score": cvss.get("score"),
+                "file_path": dependency.get("manifest_path"),
+                "advisory_url": alert.get("html_url"),
+                "references": [alert.get("html_url")] if alert.get("html_url") else [],
+                "target": repo_url,
+                "source": "github_dependabot",
+            })
+
+        branch_protection = insights.get("branch_protection") if isinstance(insights.get("branch_protection"), dict) else {}
+        if branch_protection.get("available") and branch_protection.get("protected") is False:
+            branch = str(source_config.get("branch") or "main")
+            findings.append({
+                "type": "github",
+                "tool": "github-api",
+                "rule_id": "github-branch-protection-disabled",
+                "severity": "MEDIUM",
+                "confidence": "HIGH",
+                "confidence_score": 0.82,
+                "confidence_label": "HIGH",
+                "title": f"Branch protection is not configured for {branch}",
+                "message": "GitHub reported no branch protection rules for the scanned branch.",
+                "recommendation": "Require pull requests, status checks, and restricted direct pushes for protected branches.",
+                "target": repo_url,
+                "endpoint": f"{repo_url}/settings/branches",
+                "source": "github_branch_protection",
+            })
+        return findings
 
     async def _run_dast_sources(
         self,

@@ -6,6 +6,7 @@ without requiring external tools like semgrep or trufflehog.
 """
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -54,6 +55,21 @@ SKIP_FILE_PATTERNS = [
     re.compile(r"^report-\d{4}-\d{2}-\d{2}\.md$"),
     re.compile(r"^scan-results.*"),
 ]
+
+
+def _excluded_by_pattern(file_path: Path, target: Path, exclude_patterns: list[str]) -> bool:
+    try:
+        rel = file_path.relative_to(target if target.is_dir() else target.parent).as_posix()
+    except ValueError:
+        rel = file_path.as_posix()
+    name = file_path.name
+    for raw_pattern in exclude_patterns:
+        pattern = raw_pattern.strip().replace("\\", "/").lstrip("./")
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern) or Path(rel).match(pattern):
+            return True
+    return False
 
 
 @dataclass
@@ -217,24 +233,26 @@ class InlineScanner:
         self,
         target_path: str,
         sensitivity: str = "medium",
+        exclude_patterns: list[str] | None = None,
         progress_callback=None,
     ) -> InlineScanResult:
         """Run inline scan on a directory."""
         start = time.time()
         result = InlineScanResult()
         target = Path(target_path)
+        excludes = exclude_patterns or []
         if not target.exists():
             return result
 
         if target.is_file():
-            files = [target] if self._should_scan_file(target) else []
+            files = [target] if self._should_scan_file(target) and not _excluded_by_pattern(target, target, excludes) else []
         else:
             files = []
             for root, dirs, filenames in os.walk(target):
                 dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
                 for fname in filenames:
                     fp = Path(root) / fname
-                    if self._should_scan_file(fp):
+                    if self._should_scan_file(fp) and not _excluded_by_pattern(fp, target, excludes):
                         files.append(fp)
 
         result.total_files = len(files)

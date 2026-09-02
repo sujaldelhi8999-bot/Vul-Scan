@@ -410,12 +410,19 @@ async def brutal_ops(
 async def brutal_shell_ws(websocket: WebSocket, shell_id: str) -> None:
     """Interactive shell console. Each client message is one command; the
     server replies with one output frame."""
-    token = websocket.query_params.get("token", "")
+    protocol_header = websocket.headers.get("sec-websocket-protocol") or ""
+    ticket = next((part.strip().removeprefix("ticket.") for part in protocol_header.split(",") if part.strip().startswith("ticket.")), "")
+    token = ticket or websocket.query_params.get("wst", "") or websocket.query_params.get("token", "")
     user: dict | None = None
     expired = False
     if token:
         try:
-            payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+            if ticket:
+                payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"], audience="phantomscan-ws")
+                if payload.get("typ") != "ws-ticket" or payload.get("scope") != "brutal":
+                    raise jwt.InvalidTokenError("invalid websocket ticket scope")
+            else:
+                payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
             user = await get_user_by_id(payload.get("sub", ""))
             membership = await get_enterprise_membership(user["id"]) if user else None
             if user and membership:
@@ -442,7 +449,8 @@ async def brutal_shell_ws(websocket: WebSocket, shell_id: str) -> None:
         await websocket.close(code=1008)
         return
 
-    await websocket.accept()
+    offered = {part.strip() for part in protocol_header.split(",")}
+    await websocket.accept(subprotocol="phantomscan.ws-ticket" if "phantomscan.ws-ticket" in offered else None)
     await websocket.send_text("__ready__")
     try:
         while True:

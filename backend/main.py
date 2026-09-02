@@ -1,11 +1,36 @@
 import asyncio
 import logging
+import re
 import sys
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
+class CredentialRedactionFilter(logging.Filter):
+    _patterns = (
+        re.compile(r"(?i)([?&](?:token|wst|access_token|refresh_token)=)([^\s&\"']+)"),
+        re.compile(r"(?i)(\bBearer\s+)([^\s,\"']+)"),
+        re.compile(r"(?i)(\bticket\.)([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"),
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        redacted = message
+        for pattern in self._patterns:
+            redacted = pattern.sub(r"\1[REDACTED]", redacted)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
 logging.basicConfig(level=logging.INFO)
+_credential_filter = CredentialRedactionFilter()
+for _logger_name in ("uvicorn.access", "uvicorn.error", "phantomscan"):
+    logging.getLogger(_logger_name).addFilter(_credential_filter)
 logger = logging.getLogger("phantomscan")
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -24,6 +49,7 @@ from app.agents.self_audit import SelfAuditAgent
 from app.config import get_settings
 from app.database import (
     add_audit_log,
+    close_database,
     database_is_available,
     get_audit_logs,
     get_findings,
@@ -33,7 +59,7 @@ from app.database import (
     initialize_database,
 )
 from app.models import HealthResponse
-from app.routers import active, admin_scope, agents, ai, auth, attack_planner, authorization, brutal, dos, enterprise, execution, findings, github, intelligence, lab, learning, logs, multi_source, rule_scan, sast, scan, self_audit
+from app.routers import active, admin_scope, agents, ai, assets, attack_paths, auth, authorization, brutal, callback, dos, enterprise, execution, findings, github, intelligence, lab, learning, logs, multi_source, rule_scan, sast, scan, security_priorities, self_audit, artifacts, hack_guide
 from app.services.jobs import scan_job_manager
 from app.services.openrouter_client import get_ai_status
 from app.websockets import scan_event_broker
@@ -70,8 +96,13 @@ WS_CLOSE_SCAN_NOT_FOUND = 4044
 security = HTTPBearer(auto_error=False)
 
 
+def websocket_subprotocol(websocket: WebSocket) -> str | None:
+    offered = {part.strip() for part in (websocket.headers.get("sec-websocket-protocol") or "").split(",")}
+    return "phantomscan.ws-ticket" if "phantomscan.ws-ticket" in offered else None
+
+
 async def get_current_user_ws(websocket: WebSocket) -> tuple[dict | None, int | None]:
-    """Validate WebSocket connection via token in query params or headers.
+    """Validate WebSocket connection via short-lived ticket or legacy token.
 
     Returns ``(user, close_code)`` where ``close_code`` is ``None`` on success
     and the close code to use on rejection. Does NOT call ``websocket.close()``
@@ -80,6 +111,65 @@ async def get_current_user_ws(websocket: WebSocket) -> tuple[dict | None, int | 
     # When WebSocket auth is disabled, allow all connections
     if not settings.require_auth_on_websocket:
         return {"id": "ws-anonymous", "role": "user"}, None
+
+    def protocol_ticket() -> str | None:
+        header = websocket.headers.get("sec-websocket-protocol") or ""
+        for part in header.split(","):
+            value = part.strip()
+            if value.startswith("ticket."):
+                return value.removeprefix("ticket.")
+        return None
+
+    async def user_from_id(user_id: str) -> dict | None:
+        from app.database import get_user_by_id
+        user = await get_user_by_id(user_id)
+        if user and user.get("subscription_status") != "canceled":
+            membership = await get_enterprise_membership(user_id)
+            if membership:
+                user.update(
+                    {
+                        "enterprise_id": membership["enterprise_id"],
+                        "enterprise_role": membership["enterprise_role"],
+                        "max_severity": membership.get("max_severity", "LOW"),
+                        "enterprise_membership_active": bool(membership.get("membership_active", 1)),
+                    }
+                )
+            return user
+        return None
+
+    ticket = protocol_ticket() or websocket.query_params.get("wst")
+    if ticket and settings.secret_key:
+        try:
+            import jwt
+            payload = jwt.decode(ticket, settings.secret_key, algorithms=["HS256"], audience="phantomscan-ws")
+            if payload.get("typ") != "ws-ticket":
+                logger.warning("WebSocket connection rejected: credential is not a WS ticket")
+                return None, WS_CLOSE_AUTH_FAILED
+            scope = payload.get("scope")
+            path = websocket.url.path
+            if path == "/ws/status" and scope != "status":
+                logger.warning("WebSocket connection rejected: ticket scope mismatch")
+                return None, WS_CLOSE_AUTH_FAILED
+            if path.startswith("/ws/scan/") or path.startswith("/ws/scanner/"):
+                scan_id = int(path.rsplit("/", 1)[-1])
+                if scope != "scan" or int(payload.get("scan_id") or 0) != scan_id:
+                    logger.warning("WebSocket connection rejected: ticket scan scope mismatch")
+                    return None, WS_CLOSE_AUTH_FAILED
+            user_id = payload.get("sub")
+            if not user_id:
+                logger.warning("WebSocket connection rejected: ticket missing subject claim")
+                return None, WS_CLOSE_AUTH_FAILED
+            user = await user_from_id(str(user_id))
+            if user:
+                return user, None
+            logger.warning("WebSocket connection rejected: ticket user unavailable")
+            return None, WS_CLOSE_AUTH_FAILED
+        except jwt.ExpiredSignatureError:
+            logger.warning("WebSocket connection rejected: WS ticket expired")
+            return None, WS_CLOSE_TOKEN_EXPIRED
+        except jwt.InvalidTokenError:
+            logger.warning("WebSocket connection rejected: invalid WS ticket")
+            return None, WS_CLOSE_AUTH_FAILED
 
     token = websocket.query_params.get("token")
     if not token:
@@ -104,24 +194,13 @@ async def get_current_user_ws(websocket: WebSocket) -> tuple[dict | None, int | 
     if settings.secret_key:
         try:
             import jwt
-            from app.database import get_user_by_id
             payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
             user_id = payload.get("sub")
             if user_id:
                 exp = payload.get("exp")
                 if not exp or datetime.fromtimestamp(exp, tz=timezone.utc) >= datetime.now(timezone.utc):
-                    user = await get_user_by_id(user_id)
-                    if user and user.get("subscription_status") != "canceled":
-                        membership = await get_enterprise_membership(user_id)
-                        if membership:
-                            user.update(
-                                {
-                                    "enterprise_id": membership["enterprise_id"],
-                                    "enterprise_role": membership["enterprise_role"],
-                                    "max_severity": membership.get("max_severity", "LOW"),
-                                    "enterprise_membership_active": bool(membership.get("membership_active", 1)),
-                                }
-                            )
+                    user = await user_from_id(user_id)
+                    if user:
                         return user, None
                     logger.warning("WebSocket connection rejected: token did not match any credential")
                 else:
@@ -164,39 +243,40 @@ async def lifespan(application: FastAPI):
     restored = await BrutalSessionManager.restore()
     logger.info("Restored %d persisted Brutal sessions", restored)
 
-    from app.database import get_connection as _recovery_conn
+    from app.database import get_connection as _recovery_read_conn, get_write_connection as _recovery_write_conn
     try:
-        async with _recovery_conn() as _conn:
+        async with _recovery_read_conn() as _conn:
             _cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
             _cur = await _conn.execute(
                 "SELECT id, target_url, scan_id FROM authorized_test_jobs WHERE status IN ('QUEUED', 'RUNNING') AND updated_at < ?",
                 (_cutoff,),
             )
             _stuck_rows = await _cur.fetchall()
-            for _row in _stuck_rows:
-                _jid = str(_row["id"])
-                try:
+        for _row in _stuck_rows:
+            _jid = str(_row["id"])
+            try:
+                async with _recovery_write_conn() as _conn:
                     await _conn.execute(
                         "UPDATE authorized_test_jobs SET status = 'FAILED', error_message = ?, error_code = ?, completed_at = ? WHERE id = ?",
                         ("Backend restart interrupted execution", "BACKEND_RESTART", datetime.now(timezone.utc).isoformat(), _jid),
                     )
                     await _conn.commit()
-                    _turl = str(_row["target_url"]) if _row["target_url"] else ""
-                    from app.services.active_gate import ActiveTargetGate
-                    _ilab = ActiveTargetGate.is_builtin_lab_target(_turl) if _turl else False
-                    from app.services.execution_status import update_authorized_test_execution as _recover_exec
-                    await _recover_exec(
-                        job_id=_jid,
-                        lifecycle="FAILED",
-                        target_url=_turl,
-                        scan_id=_row["scan_id"],
-                        is_lab=_ilab,
-                        error_message="Backend restart interrupted execution",
-                        error_code="BACKEND_RESTART",
-                    )
-                    logger.warning("Recovery: marked job %s as FAILED (backend restart)", _jid)
-                except Exception as _exc:
-                    logger.error("Recovery: failed to mark job %s: %s", _jid, _exc)
+                _turl = str(_row["target_url"]) if _row["target_url"] else ""
+                from app.services.active_gate import ActiveTargetGate
+                _ilab = ActiveTargetGate.is_builtin_lab_target(_turl) if _turl else False
+                from app.services.execution_status import update_authorized_test_execution as _recover_exec
+                await _recover_exec(
+                    job_id=_jid,
+                    lifecycle="FAILED",
+                    target_url=_turl,
+                    scan_id=_row["scan_id"],
+                    is_lab=_ilab,
+                    error_message="Backend restart interrupted execution",
+                    error_code="BACKEND_RESTART",
+                )
+                logger.warning("Recovery: marked job %s as FAILED (backend restart)", _jid)
+            except Exception as _exc:
+                logger.error("Recovery: failed to mark job %s: %s", _jid, _exc)
     except Exception as _exc:
         logger.error("Recovery: could not check for stuck jobs: %s", _exc)
 
@@ -217,9 +297,7 @@ async def lifespan(application: FastAPI):
         if scheduler.running:
             scheduler.shutdown(wait=False)
         await scan_job_manager.shutdown()
-        from app.database import _db_connection as _shared_conn
-        if _shared_conn is not None:
-            await _shared_conn.close()
+        await close_database()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
@@ -246,10 +324,16 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 app.include_router(scan.router)
+
+app.include_router(attack_paths.router)
+app.include_router(hack_guide.router)
+app.include_router(artifacts.router)
 app.include_router(active.router)
+app.include_router(callback.router)
 app.include_router(admin_scope.router)
 app.include_router(auth.router)
 app.include_router(ai.router)
+app.include_router(assets.router)
 app.include_router(authorization.router)
 app.include_router(dos.router)
 app.include_router(agents.router)
@@ -264,9 +348,10 @@ app.include_router(github.router)
 app.include_router(multi_source.router)
 app.include_router(sast.router)
 app.include_router(brutal.router)
-app.include_router(attack_planner.router)
+app.include_router(security_priorities.router)
 app.include_router(rule_scan.router)
 app.include_router(enterprise.router)
+app.add_api_route("/api/scanner/start", scan.start_scan, methods=["POST"], status_code=status.HTTP_201_CREATED)
 
 # The brutal router carries the /api/brutal prefix, so its WebSocket console is
 # registered here at the /ws/* path the frontend connects to.
@@ -346,7 +431,7 @@ async def scan_snapshot(scan_id: int, scan_record: dict[str, Any], user: dict[st
 async def global_status(websocket: WebSocket) -> None:
     # Accept the connection first to complete the HTTP upgrade
     # (prevents "Pending" state in browser when auth fails)
-    await websocket.accept()
+    await websocket.accept(subprotocol=websocket_subprotocol(websocket))
     user, close_code = await get_current_user_ws(websocket)
     if not user:
         reason = "Token expired" if close_code == WS_CLOSE_TOKEN_EXPIRED else "Authentication failed"
@@ -381,7 +466,7 @@ async def global_status(websocket: WebSocket) -> None:
 @app.websocket("/ws/scan/{scan_id}")
 async def scan_updates(websocket: WebSocket, scan_id: int) -> None:
     # Accept the connection first to complete the HTTP upgrade
-    await websocket.accept()
+    await websocket.accept(subprotocol=websocket_subprotocol(websocket))
     user, close_code = await get_current_user_ws(websocket)
     if not user:
         reason = "Token expired" if close_code == WS_CLOSE_TOKEN_EXPIRED else "Authentication failed"
@@ -407,6 +492,7 @@ async def scan_updates(websocket: WebSocket, scan_id: int) -> None:
         queue = await scan_event_broker.subscribe(scan_id)
         await websocket.send_json(await scan_snapshot(scan_id, scan_record, user))
         if scan_record["status"] in TERMINAL_SCAN_STATUSES:
+            await asyncio.sleep(0.5)
             await websocket.close(code=1000)
             return
 
@@ -430,6 +516,7 @@ async def scan_updates(websocket: WebSocket, scan_id: int) -> None:
                 return
             if scan_record["status"] in TERMINAL_SCAN_STATUSES:
                 await websocket.send_json(await scan_snapshot(scan_id, scan_record, user))
+                await asyncio.sleep(0.5)
                 await websocket.close(code=1000)
                 return
     except (WebSocketDisconnect, RuntimeError):
@@ -444,3 +531,6 @@ async def scan_updates(websocket: WebSocket, scan_id: int) -> None:
     finally:
         if queue is not None:
             await scan_event_broker.unsubscribe(scan_id, queue)
+
+
+app.add_api_websocket_route("/ws/scanner/{scan_id}", scan_updates)

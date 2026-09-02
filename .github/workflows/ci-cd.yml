@@ -49,23 +49,6 @@ jobs:
     defaults:
       run:
         working-directory: ./backend
-    services:
-      postgres:
-        image: timescale/timescaledb:latest-pg16
-        env:
-          POSTGRES_USER: phantomscan
-          POSTGRES_PASSWORD: phantomscan
-          POSTGRES_DB: phantomscan
-        ports: [5432:5432]
-        options: >-
-          --health-cmd "pg_isready -U phantomscan -d phantomscan"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      redis:
-        image: redis:7-alpine
-        ports: [6379:6379]
-        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
     steps:
       - uses: actions/checkout@v4
       
@@ -77,28 +60,21 @@ jobs:
       
       - name: Install dependencies
         run: pip install -r requirements.txt
-      
-      - name: Wait for services
-        run: |
-          sleep 10
-          pg_isready -h localhost -p 5432 -U phantomscan -d phantomscan
-          redis-cli -h localhost -p 6379 ping
-      
-      - name: Run Alembic migrations
-        run: |
-          DATABASE_URL=postgresql+asyncpg://phantomscan:phantomscan@localhost:5432/phantomscan \
-          alembic -c alembic/alembic.ini upgrade head
-        env:
-          DATABASE_URL: postgresql+asyncpg://phantomscan:phantomscan@localhost:5432/phantomscan
+
+      - name: Prepare isolated SQLite test database
+        run: rm -f test.db test.db-wal test.db-shm
       
       - name: Run pytest
         run: pytest tests/ -v --tb=short --cov=app --cov-report=xml
         env:
-          DATABASE_URL: postgresql+asyncpg://phantomscan:phantomscan@localhost:5432/phantomscan
-          REDIS_URL: redis://localhost:6379/0
+          PHANTOMSCAN_TEST_DATABASE_URL: sqlite:///./test.db
           SECRET_KEY: test-secret-key-for-ci
           OPENROUTER_API_KEY: ""
           NVD_API_KEY: ""
+
+      - name: Clean up SQLite test database
+        if: always()
+        run: rm -f test.db test.db-wal test.db-shm
       
       - name: Upload coverage
         uses: codecov/codecov-action@v4
@@ -184,7 +160,7 @@ jobs:
         run: npm ci
       
       - name: Run tests
-        run: npm test -- --coverage --watchAll=false || true
+        run: npm test -- --coverage --watchAll=false
       
       - name: Build
         run: npm run build
@@ -305,12 +281,12 @@ jobs:
       
       - name: Run smoke tests
         run: |
-          # Test scan creation
-          curl -X POST http://localhost:8000/api/scan/start \
+          # Auth should reject the placeholder token; this still verifies the API is reachable.
+          status=$(curl -s -o /tmp/scan-smoke.json -w "%{http_code}" -X POST http://localhost:8000/api/scan/start \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer test-token" \
-            -d '{"target_url": "http://localhost:8000/lab/phantombank", "mode": "defend", "intensity": "low"}' \
-            || echo "Scan test completed"
+            -d '{"target_url": "http://localhost:8000/lab/phantombank", "mode": "defend", "intensity": "low"}')
+          test "$status" = "401"
       
       - name: Cleanup
         if: always()

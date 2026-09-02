@@ -47,6 +47,8 @@ class SandboxManagerAgent(Agent):
     async def run_active_scan(self, payload: dict[str, Any], scan_id: int) -> dict[str, Any]:
         self.scan_id = scan_id
         self.status = "active"
+        self.process = None
+        self._memory_exceeded = False
         self.sandbox_id = f"sandbox-{uuid.uuid4().hex[:12]}"
         payload = {
             **payload,
@@ -107,7 +109,7 @@ class SandboxManagerAgent(Agent):
                 raise SandboxExecutionError("Active worker exceeded the scan time limit") from exc
             except asyncio.CancelledError:
                 await self.terminate()
-                raise SandboxExecutionError("Active worker exceeded the scan time limit")
+                raise
             finally:
                 monitor.cancel()
                 await asyncio.gather(monitor, return_exceptions=True)
@@ -128,18 +130,21 @@ class SandboxManagerAgent(Agent):
     async def _run_inline(self, payload: dict[str, Any]) -> dict[str, Any]:
         from app.workers.active_worker import execute
 
-        result = await execute(payload)
+        result = await asyncio.wait_for(execute(payload), timeout=self.limits.max_scan_duration)
         if not isinstance(result, dict):
             raise SandboxExecutionError("Active worker returned invalid structured output")
         return result
 
     async def _finalize(self, result: dict[str, Any]) -> dict[str, Any]:
-        if result.get("status") != "complete":
+        worker_status = str(result.get("status") or "error")
+        if worker_status != "complete" and not isinstance(result.get("result"), dict):
             raise SandboxExecutionError(str(result.get("error", "Active worker did not complete")))
-        self.status = "complete"
+        self.status = "complete" if worker_status == "complete" else worker_status
         await self.log_action("sandbox_destroyed", self.sandbox_id)
+        worker_result = result.get("result") or {}
         return {
-            **result["result"],
+            **worker_result,
+            "worker_status": worker_status,
             "sandbox_id": self.sandbox_id,
         }
 

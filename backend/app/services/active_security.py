@@ -1,12 +1,17 @@
 import asyncio
+import hashlib
 import json
 import logging
+import random
 import re
+import socket
+import ssl
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -16,7 +21,10 @@ from app.config import get_settings
 from app.database import add_audit_log, create_evidence_record, update_evidence_finding
 from app.security import build_finding, redact_sensitive, redact_url
 from app.services.active_gate import ActiveTargetGate
+from app.services.asset_cache import asset_cache
 from app.services.authorization import TargetAuthorizationService, canonicalize_target
+from app.services.callback_registry import callback_registry
+from app.services.correlation_graph import build_correlation_graph
 from app.services.execution import ExecutionBudget, ExecutionLimitError, SafetyLimits, ScanCancelled
 from app.services.tci import TargetComplexityIndex, band_for_score
 
@@ -271,12 +279,402 @@ class WorkflowRules:
         return cls(business_logic_tests=[item for item in business_logic_tests if isinstance(item, dict)])
 
 
+@dataclass(frozen=True)
+class VerificationResult:
+    confirmed: bool
+    confidence: str
+    confidence_score: float
+    stage: str
+    method: str
+    payload: str
+    evidence_text: str
+    reproduction_command: str
+    request_response_diff: str
+    verification_hash: str
+    request_id: str
+    response_status: int | None
+    evidence_ids: list[int]
+
+
+def _normalize_body_for_fingerprint(body: str) -> str:
+    text = re.sub(r"\s+", " ", str(body or "").lower()).strip()
+    text = re.sub(r"[a-f0-9]{16,}", "<hex>", text)
+    text = re.sub(r"\d{4,}", "<num>", text)
+    return text[:8000]
+
+
+def response_fingerprint(response: dict[str, Any]) -> dict[str, Any]:
+    headers = response.get("headers") or {}
+    normalized_body = _normalize_body_for_fingerprint(str(response.get("raw_body") or response.get("body") or ""))
+    important_headers = {
+        key: str(headers.get(key) or "")[:120]
+        for key in ("content-type", "server", "x-vercel-id", "cf-ray", "location")
+        if headers.get(key)
+    }
+    return {
+        "status_code": response.get("status_code"),
+        "content_type": str(headers.get("content-type") or "").split(";")[0].lower(),
+        "body_length_bucket": len(normalized_body) // 128,
+        "body_hash": hashlib.sha256(normalized_body.encode("utf-8", errors="ignore")).hexdigest()[:16],
+        "headers": important_headers,
+    }
+
+
+def same_response_fingerprint(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    return response_fingerprint(first) == response_fingerprint(second)
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def build_curl_command(method: str, url: str, headers: dict[str, str] | None = None, json_body: Any = None) -> str:
+    parts = ["curl", "-i", "-X", method.upper(), _shell_quote(url)]
+    for key, value in sorted((headers or {}).items()):
+        parts.extend(["-H", _shell_quote(f"{key}: {value}")])
+    if json_body is not None:
+        parts.extend(["--json", _shell_quote(json.dumps(json_body, separators=(",", ":"), default=str))])
+    return " ".join(parts)
+
+
+def response_time_ms(response: dict[str, Any]) -> int:
+    raw = response.get("response_time_ms")
+    if raw is None and isinstance(response.get("_evidence"), dict):
+        raw = response["_evidence"].get("response_time_ms")
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+class MarkerContextParser(HTMLParser):
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self.token = token
+        self.saw_probe_span = False
+        self.saw_token_text = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {name.lower(): value or "" for name, value in attrs}
+        if tag.lower() == "span" and values.get("data-phantomscan-token") == self.token:
+            self.saw_probe_span = True
+
+    def handle_data(self, data: str) -> None:
+        if self.token in data:
+            self.saw_token_text = True
+
+
+class VerificationOrchestrator:
+    def __init__(self, engine: "ActiveSecurityEngine") -> None:
+        self.engine = engine
+
+    async def verify_reflected_html(self, surface: dict[str, Any], parameter: str) -> VerificationResult:
+        reflected = await self._verify_reflected_html_error(surface, parameter)
+        if reflected.confirmed:
+            return reflected
+        timed = await self._verify_reflected_html_time(surface, parameter)
+        if timed.confirmed:
+            return timed
+        oob = await self.verify_http_callback(surface, parameter, "xss")
+        if oob and oob.confirmed:
+            return oob
+        return max([item for item in (reflected, timed, oob) if item is not None], key=lambda item: item.confidence_score)
+
+    async def _verify_reflected_html_error(self, surface: dict[str, Any], parameter: str) -> VerificationResult:
+        token = f"x-{uuid.uuid4().hex[:10]}"
+        marker = f'<span data-phantomscan-token="{token}">{token}</span>'
+        surface_id = str(surface.get("id", ""))
+        probe = await self.engine.client.request(
+            "xss",
+            "GET",
+            self.engine.with_parameter(surface, parameter, token),
+            surface=surface_id,
+            safe_test_marker=token,
+        )
+        confirm = await self.engine.client.request(
+            "xss",
+            "GET",
+            self.engine.with_parameter(surface, parameter, marker),
+            surface=surface_id,
+            safe_test_marker="PHANTOMSCAN_XSS_CONFIRM",
+        )
+        body = str(confirm.get("raw_body") or confirm.get("body") or "")
+        content_type = str((confirm.get("headers") or {}).get("content-type") or "").lower()
+        parser = MarkerContextParser(token)
+        try:
+            parser.feed(body)
+        except Exception:
+            pass
+        probe_reflected = token in str(probe.get("raw_body") or probe.get("body") or "")
+        confirmed = probe_reflected and ("text/html" in content_type or content_type == "") and parser.saw_probe_span and marker.lower() in body.lower()
+        evidence_text = (
+            "Probe token reflected and confirmation marker parsed as live HTML."
+            if confirmed
+            else "Probe did not produce independent HTML execution-context evidence."
+        )
+        return self._result(
+            confirmed=confirmed,
+            confidence="HIGH" if confirmed else "LOW",
+            confidence_score=0.9 if confirmed else 0.2,
+            stage="error",
+            method="reflected_html_context_confirmation",
+            payload=marker,
+            response=confirm,
+            evidence_text=evidence_text,
+            injection_point=f"query parameter {parameter}",
+            altered_chunk=self._snippet(body, token),
+        )
+
+    async def _verify_reflected_html_time(self, surface: dict[str, Any], parameter: str) -> VerificationResult:
+        control = f"x-{uuid.uuid4().hex[:10]}"
+        payload = f"{control}-time-probe"
+        surface_id = str(surface.get("id", ""))
+        baseline = await self.engine.baseline_response("xss", surface, parameter, control)
+        confirm = await self.engine.client.request(
+            "xss",
+            "GET",
+            self.engine.with_parameter(surface, parameter, payload),
+            surface=surface_id,
+            safe_test_marker=payload,
+        )
+        base_ms = response_time_ms(baseline)
+        confirm_ms = response_time_ms(confirm)
+        confirmed = confirm_ms >= max(900, base_ms + 750)
+        return self._result(
+            confirmed=confirmed,
+            confidence="HIGH" if confirmed else "LOW",
+            confidence_score=0.85 if confirmed else 0.15,
+            stage="time",
+            method="bounded_timing_differential",
+            payload=payload,
+            response=confirm,
+            evidence_text=(
+                f"Timing differential observed: baseline {base_ms}ms, payload {confirm_ms}ms."
+                if confirmed
+                else f"No meaningful timing differential: baseline {base_ms}ms, payload {confirm_ms}ms."
+            ),
+            injection_point=f"query parameter {parameter}",
+            altered_chunk=f"baseline={base_ms}ms; confirmation={confirm_ms}ms",
+            extra_evidence_ids=[baseline.get("_evidence_id")],
+        )
+
+    async def verify_data_layer_error(self, surface: dict[str, Any], parameter: str) -> VerificationResult:
+        error = await self._verify_data_layer_error_stage(surface, parameter)
+        if error.confirmed:
+            return error
+        timed = await self._verify_data_layer_time(surface, parameter)
+        if timed.confirmed:
+            return timed
+        oob = await self.verify_http_callback(surface, parameter, "injection")
+        if oob and oob.confirmed:
+            return oob
+        return max([item for item in (error, timed, oob) if item is not None], key=lambda item: item.confidence_score)
+
+    async def _verify_data_layer_error_stage(self, surface: dict[str, Any], parameter: str) -> VerificationResult:
+        control = f"x-{uuid.uuid4().hex[:10]}"
+        payload = "PHANTOMSCAN_DATA_PROBE"
+        surface_id = str(surface.get("id", ""))
+        baseline = await self.engine.baseline_response("injection", surface, parameter, control)
+        confirm = await self.engine.client.request(
+            "injection",
+            "GET",
+            self.engine.with_parameter(surface, parameter, payload),
+            surface=surface_id,
+            safe_test_marker=payload,
+        )
+        body = str(confirm.get("raw_body") or confirm.get("body") or "").lower()
+        baseline_body = str(baseline.get("raw_body") or baseline.get("body") or "").lower()
+        explicit_db_logic = any(token in body for token in ["data layer error", "sql", "sqlite", "odbc", "syntax", "query"])
+        differential_error = int(confirm.get("status_code") or 0) >= 500 and int(baseline.get("status_code") or 0) < 500
+        confirmed = differential_error and explicit_db_logic and body != baseline_body
+        evidence_text = (
+            "Control request succeeded while confirmation request returned explicit database-layer error evidence."
+            if confirmed
+            else "Database-layer signal was not independently confirmed by a control request."
+        )
+        return self._result(
+            confirmed=confirmed,
+            confidence="HIGH" if confirmed else "LOW",
+            confidence_score=0.9 if confirmed else 0.2,
+            stage="error",
+            method="differential_error_with_control",
+            payload=payload,
+            response=confirm,
+            evidence_text=evidence_text,
+            injection_point=f"query parameter {parameter}",
+            altered_chunk=self._snippet(str(confirm.get("raw_body") or confirm.get("body") or ""), "data"),
+            extra_evidence_ids=[baseline.get("_evidence_id")],
+        )
+
+    async def _verify_data_layer_time(self, surface: dict[str, Any], parameter: str) -> VerificationResult:
+        control = f"x-{uuid.uuid4().hex[:10]}"
+        payload = "PHANTOMSCAN_TIME_PROBE_SLEEP_1"
+        surface_id = str(surface.get("id", ""))
+        baseline = await self.engine.baseline_response("injection", surface, parameter, control)
+        confirm = await self.engine.client.request(
+            "injection",
+            "GET",
+            self.engine.with_parameter(surface, parameter, payload),
+            surface=surface_id,
+            safe_test_marker=payload,
+        )
+        base_ms = response_time_ms(baseline)
+        confirm_ms = response_time_ms(confirm)
+        confirmed = confirm_ms >= max(900, base_ms + 750)
+        return self._result(
+            confirmed=confirmed,
+            confidence="HIGH" if confirmed else "LOW",
+            confidence_score=0.85 if confirmed else 0.15,
+            stage="time",
+            method="bounded_timing_differential",
+            payload=payload,
+            response=confirm,
+            evidence_text=(
+                f"Blind timing confirmation succeeded: baseline {base_ms}ms, payload {confirm_ms}ms."
+                if confirmed
+                else f"Blind timing confirmation failed: baseline {base_ms}ms, payload {confirm_ms}ms."
+            ),
+            injection_point=f"query parameter {parameter}",
+            altered_chunk=f"baseline={base_ms}ms; confirmation={confirm_ms}ms",
+            extra_evidence_ids=[baseline.get("_evidence_id")],
+        )
+
+    async def verify_command_timing(self, surface: dict[str, Any], parameter: str) -> VerificationResult:
+        control = "127.0.0.1"
+        payload = "127.0.0.1; sleep 1"
+        surface_id = str(surface.get("id", ""))
+        baseline = await self.engine.client.request(
+            "command_injection",
+            "GET",
+            self.engine.with_parameter(surface, parameter, control),
+            surface=surface_id,
+            safe_test_marker="command_control",
+        )
+        confirm = await self.engine.client.request(
+            "command_injection",
+            "GET",
+            self.engine.with_parameter(surface, parameter, payload),
+            surface=surface_id,
+            safe_test_marker="command_sleep_probe",
+        )
+        base_ms = response_time_ms(baseline)
+        confirm_ms = response_time_ms(confirm)
+        confirmed = confirm_ms >= max(900, base_ms + 750)
+        evidence_text = (
+            f"Blind timing confirmation succeeded: baseline {base_ms}ms, payload {confirm_ms}ms."
+            if confirmed
+            else f"Blind timing confirmation failed: baseline {base_ms}ms, payload {confirm_ms}ms."
+        )
+        return self._result(
+            confirmed=confirmed,
+            confidence="CONFIRMED" if confirmed else "LOW",
+            confidence_score=0.95 if confirmed else 0.2,
+            stage="probe+confirmation",
+            method="blind_sleep_timing",
+            payload=payload,
+            response=confirm,
+            evidence_text=evidence_text,
+            injection_point=f"query parameter {parameter}",
+            altered_chunk=f"baseline={base_ms}ms; confirmation={confirm_ms}ms",
+            extra_evidence_ids=[baseline.get("_evidence_id")],
+        )
+
+    async def verify_http_callback(self, surface: dict[str, Any], parameter: str, module: str) -> VerificationResult | None:
+        settings = get_settings()
+        callback_base_url = settings.callback_base_url or (f"http://{settings.callback_domain}" if settings.callback_domain else "")
+        if not callback_base_url:
+            return None
+        token = await callback_registry.create_token()
+        callback_url = f"{callback_base_url.rstrip('/')}/callback/{token}"
+        surface_id = str(surface.get("id", ""))
+        response = await self.engine.client.request(
+            module,
+            "GET",
+            self.engine.with_parameter(surface, parameter, callback_url),
+            surface=surface_id,
+            safe_test_marker=f"callback:{token}",
+        )
+        records = await callback_registry.wait_for_callback(token, timeout=settings.callback_wait_timeout)
+        confirmed = bool(records)
+        return self._result(
+            confirmed=confirmed,
+            confidence="HIGH" if confirmed else "LOW",
+            confidence_score=0.95 if confirmed else 0.2,
+            stage="oob",
+            method="self_hosted_http_callback",
+            payload=callback_url,
+            response=response,
+            evidence_text=(
+                f"Self-hosted callback token {token} was observed."
+                if confirmed
+                else f"Self-hosted callback token {token} was not observed within the bounded wait window."
+            ),
+            injection_point=f"query parameter {parameter}",
+            altered_chunk=json.dumps(records[:3], default=str),
+        )
+
+    def _result(
+        self,
+        *,
+        confirmed: bool,
+        confidence: str,
+        confidence_score: float,
+        stage: str,
+        method: str,
+        payload: str,
+        response: dict[str, Any],
+        evidence_text: str,
+        injection_point: str,
+        altered_chunk: str,
+        extra_evidence_ids: list[Any] | None = None,
+    ) -> VerificationResult:
+        url = str(response.get("url") or self.engine.target.url)
+        request_id = str(response.get("_request_id") or uuid.uuid4().hex[:8])
+        fingerprint = hashlib.sha256(f"{method}|{url}|{payload}|{request_id}|{altered_chunk}".encode("utf-8", errors="ignore")).hexdigest()
+        evidence_ids = [item for item in list(extra_evidence_ids or []) + [response.get("_evidence_id")] if isinstance(item, int)]
+        curl_headers = response.get("request_headers") if isinstance(response.get("request_headers"), dict) else None
+        curl_body = response.get("request_json_body")
+        return VerificationResult(
+            confirmed=confirmed,
+            confidence=confidence,
+            confidence_score=max(0.0, min(1.0, float(confidence_score))),
+            stage=stage,
+            method=method,
+            payload=payload,
+            evidence_text=evidence_text,
+            reproduction_command=build_curl_command(str(response.get("method") or "GET"), url, curl_headers, curl_body),
+            request_response_diff=(
+                "--- request\n"
+                f"+++ request with payload\nInjection point: {injection_point}\nPayload: {payload}\n"
+                "--- response baseline/control\n"
+                "+++ response confirmation\n"
+                f"Altered response evidence: {altered_chunk}"
+            ),
+            verification_hash=fingerprint,
+            request_id=request_id,
+            response_status=response.get("status_code"),
+            evidence_ids=evidence_ids,
+        )
+
+    @staticmethod
+    def _snippet(body: str, needle: str, radius: int = 120) -> str:
+        if not body:
+            return ""
+        index = body.lower().find(str(needle).lower())
+        if index < 0:
+            return body[: radius * 2]
+        start = max(0, index - radius)
+        end = min(len(body), index + len(str(needle)) + radius)
+        return body[start:end]
+
+
 class SurfaceHTMLParser(HTMLParser):
     def __init__(self, target_url: str) -> None:
         super().__init__()
         self.target_url = target_url
         self.forms: list[dict[str, Any]] = []
         self.links: list[dict[str, Any]] = []
+        self.scripts: list[str] = []
         self.websocket_refs: list[str] = []
         self._current_form: dict[str, Any] | None = None
 
@@ -302,7 +700,11 @@ class SurfaceHTMLParser(HTMLParser):
                 self._current_form["parameters"].append(name)
             if input_type == "file" and "file_upload" not in self._current_form["module_hints"]:
                 self._current_form["module_hints"].append("file_upload")
-        elif tag in {"a", "script"}:
+        elif tag == "script":
+            src = values.get("src")
+            if src:
+                self.scripts.append(urljoin(self.target_url, src))
+        elif tag == "a":
             href = values.get("href") or values.get("src")
             if href:
                 absolute = urljoin(self.target_url, href)
@@ -347,13 +749,15 @@ class SurfaceHTMLParser(HTMLParser):
             hints.append("redirect")
         if any(name in params for name in ["file", "path", "download"]):
             hints.append("path_handling")
-        if "login" in path or "signin" in path:
+        if "login" in path or "signin" in path or "auth" in path:
             hints.append("auth_session")
+        if "logout" in path or "session" in path or "token" in path:
+            hints.extend(["auth_session", "jwt"])
         if "admin" in path:
             hints.append("access_control")
         if "graphql" in path:
             hints.append("graphql")
-        if "/api/" in path:
+        if "/api/" in path or path.startswith("/api"):
             hints.append("api_security")
         return list(dict.fromkeys(hints))
 
@@ -397,21 +801,31 @@ class AttackSurfaceMapper:
                 except json.JSONDecodeError:
                     data = {}
                 if isinstance(data, dict) and isinstance(data.get("surfaces"), list):
+                    baseline = await self.collect_baselines(target)
                     return {
                         "target_url": target.url,
                         "target_origin": target.origin,
                         "source": "lab_manifest",
                         "surfaces": data["surfaces"],
                         "manifest": data,
+                        "response_baselines": baseline,
                     }
 
         response = await self.fetch_url("mapper", "GET", target.url)
+        baseline = await self.collect_baselines(target, valid_response=response)
         surfaces = self.root_surfaces(target.url)
+        discovery_sources: dict[str, int] = {"root": 1}
+        filtered_surfaces: list[dict[str, Any]] = []
         if response.get("status_code") == 200:
             parser = SurfaceHTMLParser(target.url)
             parser.feed(str(response.get("body") or ""))
             surfaces.extend(parser.forms)
             surfaces.extend(parser.links)
+            discovery_sources["html_forms"] = len(parser.forms)
+            discovery_sources["html_links"] = len(parser.links)
+            script_surfaces, script_artifacts = await self.discover_from_scripts(target, parser.scripts)
+            surfaces.extend(script_surfaces)
+            discovery_sources["javascript"] = len(script_surfaces)
             for index, websocket_url in enumerate(parser.websocket_refs, start=1):
                 surfaces.append(
                     {
@@ -426,6 +840,12 @@ class AttackSurfaceMapper:
                         "description": "WebSocket reference discovered in page content.",
                     }
                 )
+            discovery_sources["websocket_refs"] = len(parser.websocket_refs)
+        else:
+            script_artifacts = []
+        document_surfaces, document_artifacts = await self.discover_from_standard_documents(target)
+        surfaces.extend(document_surfaces)
+        discovery_sources["standard_documents"] = len(document_surfaces)
         parsed = urlsplit(target.url)
         query_params = [name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)]
         if query_params:
@@ -441,12 +861,298 @@ class AttackSurfaceMapper:
                     "description": "Query parameters from the target URL.",
                 }
             )
+        surfaces = self.dedupe_surfaces(surfaces)
+        surfaces, filtered_surfaces = self.filter_spa_fallback_surfaces(surfaces, baseline)
         return {
             "target_url": target.url,
             "target_origin": target.origin,
-            "source": "html_conservative",
-            "surfaces": self.dedupe_surfaces(surfaces),
+            "source": "evidence_driven",
+            "surfaces": surfaces,
+            "response_baselines": baseline,
+            "attack_surface_graph": self.build_attack_surface_graph(target.url, surfaces),
+            "discovery_sources": discovery_sources,
+            "discovery_artifacts": {
+                "javascript": script_artifacts,
+                "standard_documents": document_artifacts,
+                "spa_filtered_surfaces": filtered_surfaces,
+            },
+            "coverage_limitations": self.coverage_limitations(baseline, filtered_surfaces),
         }
+
+    async def discover_from_scripts(self, target: Any, script_urls: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        try:
+            from app.services.browser_observation import JavaScriptStaticAnalyzer
+        except Exception:
+            return [], []
+        analyzer = JavaScriptStaticAnalyzer()
+        surfaces: list[dict[str, Any]] = []
+        artifacts: list[dict[str, Any]] = []
+        for script_url in self.same_origin_urls(target, script_urls)[:3]:
+            cached = asset_cache.get(script_url)
+            if cached is not None:
+                response = {
+                    "url": script_url,
+                    "status_code": 200,
+                    "headers": {"content-type": "application/javascript"},
+                    "raw_body": cached,
+                    "body": cached,
+                    "truncated": False,
+                    "cached": True,
+                }
+            else:
+                response = await self.fetch_url("javascript_discovery", "GET", script_url)
+            if response.get("status_code") != 200:
+                continue
+            content_type = str((response.get("headers") or {}).get("content-type") or "").lower()
+            if content_type and "javascript" not in content_type and not script_url.lower().split("?", 1)[0].endswith(".js"):
+                continue
+            source = str(response.get("raw_body") or response.get("body") or "")
+            if not response.get("cached"):
+                asset_cache.set(script_url, source)
+            analysis = analyzer.analyze(script_url, source)
+            artifacts.append(
+                {
+                    "script": redact_url(script_url),
+                    "api_endpoints": len(analysis.get("api_endpoints") or []),
+                    "routes": len(analysis.get("routes") or []),
+                    "websocket_urls": len(analysis.get("websocket_urls") or []),
+                    "source_map_references": len(analysis.get("source_map_references") or []),
+                }
+            )
+            for endpoint in analysis.get("api_endpoints") or []:
+                surfaces.append(self.surface_from_url(target, endpoint, "javascript_api", "Endpoint extracted from same-origin JavaScript bundle."))
+            for endpoint in analysis.get("graphql_endpoints") or []:
+                surface = self.surface_from_url(target, endpoint, "javascript_graphql", "GraphQL endpoint extracted from same-origin JavaScript bundle.")
+                surface["module_hints"] = list(dict.fromkeys([*surface.get("module_hints", []), "graphql"]))
+                surfaces.append(surface)
+            for route in analysis.get("routes") or []:
+                surface = self.surface_from_url(target, route, "javascript_route", "Client route extracted from same-origin JavaScript bundle.")
+                surface["client_route"] = True
+                surfaces.append(surface)
+            for websocket_url in analysis.get("websocket_urls") or []:
+                if websocket_url in self.same_origin_urls(target, [websocket_url]):
+                    parsed = urlsplit(websocket_url)
+                    surfaces.append(
+                        {
+                            "id": f"javascript_websocket_{len(surfaces) + 1}",
+                            "type": "websocket",
+                            "method": "WEBSOCKET",
+                            "url": websocket_url,
+                            "path": parsed.path or "/",
+                            "parameters": [],
+                            "module_hints": ["websocket"],
+                            "description": "WebSocket endpoint extracted from same-origin JavaScript bundle.",
+                        }
+                    )
+        return surfaces, artifacts
+
+    async def discover_from_standard_documents(self, target: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        surfaces: list[dict[str, Any]] = []
+        artifacts: list[dict[str, Any]] = []
+        robots_url = urljoin(f"{target.origin}/", "/robots.txt")
+        robots = await self.fetch_url("document_discovery", "GET", robots_url)
+        if robots.get("status_code") == 200:
+            paths = self.parse_robots_paths(str(robots.get("raw_body") or robots.get("body") or ""))
+            artifacts.append({"type": "robots", "url": redact_url(robots_url), "paths": len(paths)})
+            for path in paths[:20]:
+                surfaces.append(self.surface_from_url(target, path, "robots", "Path disclosed by robots.txt. Disallow is not treated as access control evidence."))
+        sitemap_url = urljoin(f"{target.origin}/", "/sitemap.xml")
+        sitemap = await self.fetch_url("document_discovery", "GET", sitemap_url)
+        if sitemap.get("status_code") == 200:
+            urls = self.parse_sitemap_urls(str(sitemap.get("raw_body") or sitemap.get("body") or ""))
+            artifacts.append({"type": "sitemap", "url": redact_url(sitemap_url), "urls": len(urls)})
+            for url in self.same_origin_urls(target, urls)[:20]:
+                surfaces.append(self.surface_from_url(target, url, "sitemap", "URL discovered in sitemap.xml."))
+        for doc_path in ("/openapi.json", "/api/openapi.json", "/swagger.json", "/api/swagger.json"):
+            doc_url = urljoin(f"{target.origin}/", doc_path)
+            response = await self.fetch_url("openapi_discovery", "GET", doc_url)
+            if response.get("status_code") != 200:
+                continue
+            parsed_surfaces = self.parse_openapi_surfaces(target, doc_url, str(response.get("raw_body") or response.get("body") or ""))
+            if parsed_surfaces:
+                artifacts.append({"type": "openapi", "url": redact_url(doc_url), "paths": len(parsed_surfaces)})
+                surfaces.extend(parsed_surfaces)
+                break
+        return surfaces, artifacts
+
+    def surface_from_url(self, target: Any, url_or_path: str, source: str, description: str) -> dict[str, Any]:
+        absolute = urljoin(f"{target.origin}/", url_or_path) if str(url_or_path).startswith("/") else str(url_or_path)
+        try:
+            candidate = canonicalize_target(absolute)
+            absolute = candidate.url
+        except Exception:
+            absolute = urljoin(f"{target.origin}/", str(url_or_path))
+        parsed = urlsplit(absolute)
+        parameters = [name for name, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+        hints = SurfaceHTMLParser.hints_for_parameters(parameters, SurfaceHTMLParser.hints_for_url(absolute))
+        return {
+            "id": f"{source}_{hashlib.sha256(absolute.encode('utf-8', errors='ignore')).hexdigest()[:10]}",
+            "type": source,
+            "method": "GET",
+            "path": parsed.path or "/",
+            "url": absolute,
+            "parameters": parameters,
+            "module_hints": hints,
+            "description": description,
+            "discovery_source": source,
+        }
+
+    @staticmethod
+    def parse_robots_paths(body: str) -> list[str]:
+        paths: list[str] = []
+        for match in re.findall(r"(?im)^\s*(?:allow|disallow)\s*:\s*(\S+)", body):
+            if not match or match == "/" or "*" in match:
+                continue
+            paths.append(match)
+        return list(dict.fromkeys(paths))
+
+    @staticmethod
+    def parse_sitemap_urls(body: str) -> list[str]:
+        urls = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", body, re.IGNORECASE)
+        return list(dict.fromkeys(urls))
+
+    def parse_openapi_surfaces(self, target: Any, doc_url: str, body: str) -> list[dict[str, Any]]:
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, dict) or not isinstance(data.get("paths"), dict):
+            return []
+        surfaces: list[dict[str, Any]] = []
+        for path, operations in list(data["paths"].items())[:80]:
+            if not isinstance(operations, dict):
+                continue
+            for method, operation in operations.items():
+                method_upper = str(method).upper()
+                if method_upper not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+                    continue
+                params: list[str] = []
+                if isinstance(operation, dict):
+                    for parameter in operation.get("parameters") or []:
+                        if isinstance(parameter, dict) and parameter.get("name"):
+                            params.append(str(parameter["name"]))
+                absolute = urljoin(f"{target.origin}/", str(path).lstrip("/"))
+                parsed = urlsplit(absolute)
+                hints = SurfaceHTMLParser.hints_for_parameters(params, SurfaceHTMLParser.hints_for_url(absolute))
+                if "api_security" not in hints:
+                    hints.append("api_security")
+                surfaces.append(
+                    {
+                        "id": f"openapi_{method_upper.lower()}_{hashlib.sha256((method_upper + absolute).encode('utf-8', errors='ignore')).hexdigest()[:10]}",
+                        "type": "openapi",
+                        "method": method_upper,
+                        "path": parsed.path or "/",
+                        "url": absolute,
+                        "parameters": list(dict.fromkeys(params)),
+                        "module_hints": list(dict.fromkeys(hints)),
+                        "description": f"Endpoint defined by exposed OpenAPI document {redact_url(doc_url)}.",
+                        "discovery_source": "openapi",
+                    }
+                )
+        return surfaces
+
+    @staticmethod
+    def same_origin_urls(target: Any, urls: list[str]) -> list[str]:
+        same_origin: list[str] = []
+        for url in urls:
+            text = str(url).strip()
+            if not text:
+                continue
+            absolute = urljoin(f"{target.origin}/", text) if text.startswith("/") else text
+            parsed = urlsplit(absolute)
+            if parsed.scheme in {"ws", "wss"}:
+                if parsed.netloc.lower() == urlsplit(target.origin).netloc.lower():
+                    same_origin.append(absolute)
+                continue
+            try:
+                if canonicalize_target(absolute).origin == target.origin:
+                    same_origin.append(absolute)
+            except Exception:
+                continue
+        return list(dict.fromkeys(same_origin))
+
+    @staticmethod
+    def filter_spa_fallback_surfaces(surfaces: list[dict[str, Any]], baseline: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        classifications = baseline.get("classifications") or {}
+        if not classifications.get("spa_or_wildcard_fallback"):
+            return surfaces, []
+        kept: list[dict[str, Any]] = []
+        filtered: list[dict[str, Any]] = []
+        for surface in surfaces:
+            hints = {normalize_module(str(hint)) for hint in surface.get("module_hints") or []}
+            is_client_page = surface.get("type") in {"link", "javascript_route", "sitemap", "robots"}
+            if is_client_page and not surface.get("parameters") and not (hints & {"api_security", "auth_session", "graphql", "websocket"}):
+                filtered.append({"path": surface.get("path"), "source": surface.get("discovery_source") or surface.get("type")})
+                continue
+            kept.append(surface)
+        return kept, filtered
+
+    @staticmethod
+    def build_attack_surface_graph(target_url: str, surfaces: list[dict[str, Any]]) -> dict[str, Any]:
+        nodes = [{"id": "target", "type": "target", "url": redact_url(target_url)}]
+        edges: list[dict[str, Any]] = []
+        for surface in surfaces:
+            node_id = str(surface.get("id") or hashlib.sha256(str(surface.get("url") or surface.get("path")).encode()).hexdigest()[:10])
+            nodes.append(
+                {
+                    "id": node_id,
+                    "type": surface.get("type") or "endpoint",
+                    "method": surface.get("method") or "GET",
+                    "path": surface.get("path"),
+                    "parameters": surface.get("parameters") or [],
+                    "module_hints": surface.get("module_hints") or [],
+                }
+            )
+            edges.append({"from": "target", "to": node_id, "source": surface.get("discovery_source") or surface.get("type") or "unknown"})
+        return {"nodes": nodes, "edges": edges}
+
+    @staticmethod
+    def coverage_limitations(baseline: dict[str, Any], filtered_surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        limitations: list[dict[str, Any]] = []
+        classifications = baseline.get("classifications") or {}
+        if classifications.get("blanket_denial"):
+            limitations.append({"type": "BLOCKED_BY_EDGE_OR_WAF", "details": "Random nonexistent paths returned the same denial fingerprint."})
+        if classifications.get("spa_or_wildcard_fallback"):
+            limitations.append({"type": "SPA_OR_WILDCARD_FALLBACK", "details": f"{len(filtered_surfaces)} fallback-like page routes were not treated as independent server endpoints."})
+        return limitations
+
+    async def collect_baselines(self, target: Any, valid_response: dict[str, Any] | None = None) -> dict[str, Any]:
+        random_token = f"phantomscan-no-such-{uuid.uuid4().hex[:12]}"
+        probes = {
+            "valid_url": target.url,
+            "random_nonexistent": urljoin(f"{target.origin}/", f"/{random_token}"),
+            "random_nested_nonexistent": urljoin(f"{target.origin}/", f"/{random_token}/nested/{uuid.uuid4().hex[:8]}"),
+            "invalid_query_parameter": self._with_query(target.url, f"{random_token}_param", random_token),
+        }
+        responses: dict[str, Any] = {}
+        raw_responses: dict[str, dict[str, Any]] = {}
+        for name, url in probes.items():
+            if name == "valid_url" and valid_response is not None:
+                response = valid_response
+            else:
+                response = await self.fetch_url("baseline", "GET", url)
+            raw_responses[name] = response
+            responses[name] = {
+                "url": redact_url(str(response.get("url") or url)),
+                "status_code": response.get("status_code"),
+                "fingerprint": response_fingerprint(response),
+            }
+        responses["classifications"] = {
+            "spa_or_wildcard_fallback": same_response_fingerprint(raw_responses["valid_url"], raw_responses["random_nonexistent"]),
+            "consistent_nonexistent_status": raw_responses["random_nonexistent"].get("status_code") == raw_responses["random_nested_nonexistent"].get("status_code"),
+            "blanket_denial": bool(
+                raw_responses["random_nonexistent"].get("status_code") in {401, 403}
+                and same_response_fingerprint(raw_responses["random_nonexistent"], raw_responses["random_nested_nonexistent"])
+            ),
+        }
+        return responses
+
+    @staticmethod
+    def _with_query(url: str, name: str, value: str) -> str:
+        parsed = urlsplit(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query[name] = value
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(query), ""))
 
     async def fetch_url(
         self,
@@ -509,8 +1215,10 @@ class AttackSurfaceMapper:
 
 
 class SecurityTestPlanner:
+    STATIC_ASSET_RE = re.compile(r"\.(?:css|js|mjs|map|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|mp4|webm|zip)(?:$|[?#])", re.IGNORECASE)
+
     def create_plan(self, attack_surface: dict[str, Any], selected_modules: list[str] | None = None) -> dict[str, Any]:
-        surfaces = [surface for surface in attack_surface.get("surfaces", []) if isinstance(surface, dict)]
+        surfaces = self.prune_surfaces([surface for surface in attack_surface.get("surfaces", []) if isinstance(surface, dict)])
         selected = normalize_modules(selected_modules)
         relevant_modules = selected or self.modules_from_surfaces(surfaces)
         
@@ -567,6 +1275,25 @@ class SecurityTestPlanner:
                 "auto_filtered": not selected,
             },
         }
+
+    def prune_surfaces(self, surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        pruned: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, tuple[str, ...]]] = set()
+        for surface in surfaces:
+            target = str(surface.get("url") or surface.get("path") or surface.get("id") or "")
+            if self.STATIC_ASSET_RE.search(target):
+                continue
+            parsed = urlsplit(target)
+            path = parsed.path or target or "/"
+            normalized_path = re.sub(r"/\d+(?=/|$)", "/{id}", path)
+            normalized_path = re.sub(r"/[a-f0-9]{16,}(?=/|$)", "/{id}", normalized_path, flags=re.IGNORECASE)
+            parameters = tuple(sorted(str(item).lower() for item in surface.get("parameters") or []))
+            key = (str(surface.get("method") or "GET").upper(), normalized_path, parameters)
+            if key in seen:
+                continue
+            seen.add(key)
+            pruned.append(surface)
+        return pruned
 
     def create_verification_plan(
         self,
@@ -704,6 +1431,7 @@ class ActiveTargetClient:
         self.transport = transport
         self.emit_event = emit_event
         self.job_id = job_id
+        self.semaphore = asyncio.Semaphore(max(1, int(get_settings().active_max_concurrency)))
 
     async def request(
         self,
@@ -781,64 +1509,80 @@ class ActiveTargetClient:
             "finding_id": None,
             "error": None,
         }
+        throttle_delay = 0.0
         try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=False,
-                trust_env=False,
-                transport=self.transport,
-                headers={"User-Agent": "PhantomScan-ActiveSecurity/1.0"},
-            ) as client:
-                async with client.stream(method, candidate.url, headers=headers, json=json_body) as response:
-                    body = bytearray()
-                    truncated = False
-                    async for chunk in response.aiter_bytes():
-                        remaining = self.budget.limits.max_response_size - len(body)
-                        if remaining <= 0:
-                            truncated = True
-                            break
-                        body.extend(chunk[:remaining])
-                        if len(chunk) > remaining:
-                            truncated = True
-                            break
-                    decoded = body.decode(response.encoding or "utf-8", errors="replace")
-                    end_ts = datetime.now(timezone.utc).isoformat()
-                    duration_ms = round((datetime.now(timezone.utc) - datetime.fromisoformat(start_ts)).total_seconds() * 1000)
-                    safe_resp_headers = {k: "[REDACTED]" if k.lower() in {"set-cookie", "authorization"} else v for k, v in response.headers.items()}
-                    resp_summary = decoded[:300] if decoded else ""
-                    evidence["response_status"] = response.status_code
-                    evidence["response_time_ms"] = duration_ms
-                    evidence["response_observed"] = True
-                    if self.emit_event:
-                        await self.emit_event(
-                            "RESPONSE_RECEIVED",
-                            f"HTTP {response.status_code} from {request_path}",
-                            module=module,
-                            status=str(response.status_code),
-                            metadata={
-                                "request_id": request_id,
+            for attempt in range(3):
+                if throttle_delay > 0:
+                    await asyncio.sleep(throttle_delay)
+                async with self.semaphore:
+                    async with httpx.AsyncClient(
+                        timeout=timeout,
+                        follow_redirects=False,
+                        trust_env=False,
+                        transport=self.transport,
+                        headers={"User-Agent": "PhantomScan-ActiveSecurity/1.0"},
+                    ) as client:
+                        async with client.stream(method, candidate.url, headers=headers, json=json_body) as response:
+                            if response.status_code in {429, 503} and attempt < 2:
+                                retry_after = response.headers.get("retry-after")
+                                try:
+                                    throttle_delay = min(5.0, max(0.5, float(retry_after or 0)))
+                                except ValueError:
+                                    throttle_delay = 0.5
+                                throttle_delay = min(5.0, throttle_delay * (2 ** attempt) + random.uniform(0.05, 0.25))
+                                continue
+                            body = bytearray()
+                            truncated = False
+                            async for chunk in response.aiter_bytes():
+                                remaining = self.budget.limits.max_response_size - len(body)
+                                if remaining <= 0:
+                                    truncated = True
+                                    break
+                                body.extend(chunk[:remaining])
+                                if len(chunk) > remaining:
+                                    truncated = True
+                                    break
+                            decoded = body.decode(response.encoding or "utf-8", errors="replace")
+                            duration_ms = round((datetime.now(timezone.utc) - datetime.fromisoformat(start_ts)).total_seconds() * 1000)
+                            safe_resp_headers = {k: "[REDACTED]" if k.lower() in {"set-cookie", "authorization"} else v for k, v in response.headers.items()}
+                            resp_summary = decoded[:300] if decoded else ""
+                            evidence["response_status"] = response.status_code
+                            evidence["response_time_ms"] = duration_ms
+                            evidence["response_observed"] = True
+                            if self.emit_event:
+                                await self.emit_event(
+                                    "RESPONSE_RECEIVED",
+                                    f"HTTP {response.status_code} from {request_path}",
+                                    module=module,
+                                    status=str(response.status_code),
+                                    metadata={
+                                        "request_id": request_id,
+                                        "method": method,
+                                        "route": request_path,
+                                        "status_code": response.status_code,
+                                        "response_headers": safe_resp_headers,
+                                        "response_summary": resp_summary,
+                                        "truncated": truncated,
+                                        "duration_ms": duration_ms,
+                                    },
+                                )
+                            ev_result = {
+                                "url": candidate.url,
                                 "method": method,
-                                "route": request_path,
                                 "status_code": response.status_code,
-                                "response_headers": safe_resp_headers,
-                                "response_summary": resp_summary,
+                                "headers": {key.lower(): value for key, value in response.headers.items()},
+                                "request_headers": headers or {},
+                                "request_json_body": json_body,
+                                "raw_body": decoded,
+                                "body": redact_sensitive(decoded, self.budget.limits.max_response_size),
+                                "response_time_ms": duration_ms,
                                 "truncated": truncated,
-                                "duration_ms": duration_ms,
-                            },
-                        )
-                    ev_result = {
-                        "url": candidate.url,
-                        "status_code": response.status_code,
-                        "headers": {key.lower(): value for key, value in response.headers.items()},
-                        "raw_body": decoded,
-                        "body": redact_sensitive(decoded, self.budget.limits.max_response_size),
-                        "truncated": truncated,
-                        "_request_id": request_id,
-                        "_evidence": evidence,
-                    }
-                    evidence_id = await create_evidence_record(evidence)
-                    ev_result["_evidence_id"] = evidence_id
-                    return ev_result
+                                "_request_id": request_id,
+                                "_evidence": evidence,
+                            }
+                            evidence_id = await create_evidence_record(evidence)
+                            ev_result["_evidence_id"] = evidence_id
+                            return ev_result
         except httpx.HTTPError as exc:
             error_msg = str(exc)[:500]
             evidence["error"] = error_msg
@@ -858,9 +1602,11 @@ class ActiveTargetClient:
             evidence_id = await create_evidence_record(evidence)
             return {
                 "url": candidate.url,
+                "method": method,
                 "status_code": None,
                 "headers": {},
                 "body": "",
+                "response_time_ms": None,
                 "error": str(exc),
                 "truncated": False,
                 "_request_id": request_id,
@@ -893,6 +1639,16 @@ class ActiveSecurityEngine:
         self.limits = limits
         self.authorization_context = authorization_context
         self.workflow_rules = WorkflowRules.from_payload(workflow_rules)
+        profile = str((workflow_rules or {}).get("confidence_profile") or "balanced").lower()
+        if profile == "strict":
+            self.confidence_high_threshold = 0.9
+            self.confidence_medium_threshold = 0.7
+        elif profile == "aggressive":
+            self.confidence_high_threshold = 0.75
+            self.confidence_medium_threshold = 0.5
+        else:
+            self.confidence_high_threshold = get_settings().confidence_high
+            self.confidence_medium_threshold = get_settings().confidence_medium
         self.scan_id = scan_id
         self.user_id = user_id
         self.sandbox_id = sandbox_id
@@ -911,10 +1667,13 @@ class ActiveSecurityEngine:
         )
         self.mapper = AttackSurfaceMapper(fetch=self.client.request, transport=transport, limits=limits)
         self.planner = SecurityTestPlanner()
+        self.verifier = VerificationOrchestrator(self)
         self.events: list[dict[str, Any]] = []
         self.findings: list[dict[str, Any]] = []
         self.timed_out_modules: list[str] = []
         self.module_timeout = get_settings().module_timeout
+        self._sink_cache: list[dict[str, Any]] | None = None
+        self._baseline_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     async def run(self) -> dict[str, Any]:
         await self.emit("test_started", f"Active security test started for {self.target.url}")
@@ -934,9 +1693,14 @@ class ActiveSecurityEngine:
                     await self.emit("finding_created", finding["title"], selected_module=module, result=finding["severity"])
                 progress = int(10 + (index / max(1, len(plan["modules"]))) * 85)
                 was_timeout = module in self.timed_out_modules
-                status_label = f"{module}: {len(module_findings)} findings" + (" (TIMEOUT)" if was_timeout else "")
-                await self.emit("module_completed", status_label, selected_module=module)
+                if was_timeout:
+                    await self.emit("module_timed_out", f"{module}: timed out after {self.module_timeout}s", selected_module=module, result="TIMED_OUT")
+                else:
+                    await self.emit("module_completed", f"{module}: {len(module_findings)} findings", selected_module=module)
                 await self.emit("progress", f"Active security progress {progress}%", selected_module=module, request_count=self.budget.request_count)
+            if self.timed_out_modules and status == "complete":
+                status = "limited"
+                error = f"Timed-out modules: {', '.join(self.timed_out_modules)}"
             await self.emit("test_completed", f"Active security test completed with {len(self.findings)} findings")
         except ScanCancelled as exc:
             status = "cancelled"
@@ -960,6 +1724,7 @@ class ActiveSecurityEngine:
             "evidence": self.safe_evidence(),
             "findings": self.findings,
             "final_report": report,
+            "correlation_graph": build_correlation_graph(self.attack_surface, self.findings),
             "score": score_findings(self.findings, len(self.attack_surface.get("surfaces", []))),
             "request_count": self.budget.request_count,
             "sandbox_id": self.sandbox_id,
@@ -999,13 +1764,13 @@ class ActiveSecurityEngine:
             return []
         await self.emit("check_started", f"{module} checks started", selected_module=module)
         try:
-            results = await asyncio.wait_for(handler(surfaces[:3]), timeout=self.module_timeout)
+            results = await asyncio.wait_for(handler(self.planner.prune_surfaces(surfaces)), timeout=self.module_timeout)
         except asyncio.TimeoutError:
             logger.warning("Module %s timed out after %ds", module, self.module_timeout)
             await self.emit("module_timeout", f"{module} timed out after {self.module_timeout}s", selected_module=module)
             self.timed_out_modules.append(module)
             return []
-        for surface in surfaces[:3]:
+        for surface in self.planner.prune_surfaces(surfaces):
             await self.emit("surface_tested", str(surface.get("id") or surface.get("path") or module), selected_module=module)
         for finding in results:
             if self.emit_event:
@@ -1064,55 +1829,85 @@ class ActiveSecurityEngine:
     async def check_injection(self, surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         findings = []
         for surface in surfaces:
-            parameter = self.first_parameter(surface, "customer")
-            response = await self.client.request(
-                "injection", "GET", self.with_parameter(surface, parameter, "PHANTOMSCAN_DATA_PROBE"),
-                surface=str(surface.get("id", "")),
-                safe_test_marker="PHANTOMSCAN_DATA_PROBE",
-            )
-            body = str(response.get("body", "")).lower()
-            if response.get("status_code") and int(response["status_code"]) >= 500 and any(token in body for token in ["data layer error", "sql", "sqlite", "odbc"]):
+            parameter = self.select_best_parameter(surface, vulnerability_type="injection")
+            if parameter is None:
+                continue
+            try:
+                verification = await asyncio.wait_for(
+                    self.verifier.verify_data_layer_error(surface, parameter),
+                    timeout=min(8.0, max(3.0, self.module_timeout / 2)),
+                )
+            except asyncio.TimeoutError:
+                logger.info("Injection verifier timed out for surface %s parameter %s", surface.get("id") or surface.get("path"), parameter)
+                continue
+            except ExecutionLimitError:
+                raise
+            except Exception as exc:
+                logger.warning("Injection verifier failed for surface %s parameter %s: %s", surface.get("id") or surface.get("path"), parameter, exc)
+                continue
+            if verification is None:
+                logger.info("Injection verifier returned no result for surface %s parameter %s", surface.get("id") or surface.get("path"), parameter)
+                continue
+            if verification.confirmed:
                 findings.append(
                     self.make_finding(
                         "Controlled data-layer probe caused an error response",
                         "Data-Layer Handling",
                         "HIGH",
-                        "HIGH",
+                        verification.confidence,
                         "injection",
                         surface,
-                        response,
-                        "A benign data-layer marker produced a server error indicator.",
+                        {"url": self.with_parameter(surface, parameter, verification.payload), "status_code": verification.response_status, "_request_id": verification.request_id},
+                        verification.evidence_text,
                         "Untrusted input may be reaching query construction or interpreter boundaries unsafely.",
                         "Use parameterized data access APIs, strict allowlists, and uniform error handling.",
                         "Repeat the controlled data-layer probe and confirm no interpreter error or marker-specific behavior occurs.",
                         parameter=parameter,
+                        evidence_records=verification.evidence_ids,
+                        verification_result=verification,
                     )
                 )
         return findings
 
     async def check_xss(self, surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         findings = []
-        marker = '<span data-phantomscan-probe="1">probe</span>'
         for surface in surfaces:
-            response = await self.client.request(
-                "xss", "GET", self.with_parameter(surface, self.first_parameter(surface, "q"), marker),
-                surface=str(surface.get("id", "")),
-                safe_test_marker="PHANTOMSCAN_XSS_PROBE",
-            )
-            if marker.lower() in str(response.get("body", "")).lower():
+            parameter = self.select_best_parameter(surface, vulnerability_type="xss")
+            if parameter is None:
+                continue
+            try:
+                verification = await asyncio.wait_for(
+                    self.verifier.verify_reflected_html(surface, parameter),
+                    timeout=min(8.0, max(3.0, self.module_timeout / 2)),
+                )
+            except asyncio.TimeoutError:
+                logger.info("XSS verifier timed out for surface %s parameter %s", surface.get("id") or surface.get("path"), parameter)
+                continue
+            except ExecutionLimitError:
+                raise
+            except Exception as exc:
+                logger.warning("XSS verifier failed for surface %s parameter %s: %s", surface.get("id") or surface.get("path"), parameter, exc)
+                continue
+            if verification is None:
+                logger.info("XSS verifier returned no result for surface %s parameter %s", surface.get("id") or surface.get("path"), parameter)
+                continue
+            if verification.confirmed:
                 findings.append(
                     self.make_finding(
                         "HTML-like input marker reflected without encoding",
                         "Output Encoding",
                         "MEDIUM",
-                        "HIGH",
+                        verification.confidence,
                         "xss",
                         surface,
-                        response,
-                        "A harmless HTML-like marker was returned as markup instead of encoded text.",
+                        {"url": self.with_parameter(surface, parameter, verification.payload), "status_code": verification.response_status, "_request_id": verification.request_id},
+                        verification.evidence_text,
                         "Executable markup could run in a browser if attacker-controlled input reaches the same context.",
                         "Apply context-aware output encoding and deploy a restrictive Content Security Policy.",
                         "Rerun the output-encoding check and confirm the marker is HTML-encoded.",
+                        parameter=parameter,
+                        evidence_records=verification.evidence_ids,
+                        verification_result=verification,
                     )
                 )
         return findings
@@ -1464,84 +2259,311 @@ class ActiveSecurityEngine:
         return findings
 
     async def check_security_headers(self, surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        findings = []
-        for surface in surfaces[:1]:
+        findings: list[dict[str, Any]] = []
+        parsed_target = urlsplit(self.target.url)
+        host = parsed_target.netloc
+        main_url = urlunsplit((parsed_target.scheme or "https", host, "/", "", ""))
+        candidates = [{"id": "main", "url": main_url, "path": "/", "parameters": []}]
+        for surface in self.planner.prune_surfaces(surfaces):
+            url = self.surface_target(surface)
+            parsed = urlsplit(urljoin(f"{self.target.origin}/", url) if url.startswith("/") else url)
+            if parsed.netloc == host and (parsed.path or "/") != "/":
+                candidates.append(surface)
+
+        grouped: dict[str, dict[str, Any]] = {}
+        responses: dict[str, dict[str, Any]] = {}
+        for surface in candidates[:20]:
             response = await self.client.request(
                 "security_headers", "GET", self.surface_target(surface),
                 surface=str(surface.get("id", "")),
                 safe_test_marker="security_headers_probe",
             )
-            headers = response.get("headers", {})
-            missing = [
-                name
-                for name in ["content-security-policy", "x-content-type-options", "referrer-policy"]
-                if name not in headers
-            ]
-            has_frame_control = "x-frame-options" in headers or "frame-ancestors" in str(headers.get("content-security-policy", ""))
+            headers = {str(k).lower(): str(v) for k, v in (response.get("headers") or {}).items()}
+            url = str(response.get("url") or self.surface_target(surface))
+            responses[url] = response
+            content_type = headers.get("content-type", "")
+            if content_type and "html" not in content_type.lower():
+                continue
+            body = str(response.get("raw_body") or response.get("body") or "")
+            is_main = self._same_origin_path(url, main_url, "/")
+
+            csp = headers.get("content-security-policy", "")
+            if not csp:
+                self._add_header_issue(grouped, host, "content-security-policy", "Missing Content-Security-Policy", "MEDIUM", url, "Header Content-Security-Policy expected but not found.")
+            elif self._weak_csp(csp) and re.search(r"<script\b", body, re.IGNORECASE):
+                self._add_header_issue(grouped, host, "content-security-policy", "Weak Content-Security-Policy", "HIGH", url, f"CSP value is weak while scripts are present: {csp[:300]}")
+
+            if "x-content-type-options" not in headers:
+                self._add_header_issue(grouped, host, "x-content-type-options", "Missing X-Content-Type-Options", "MEDIUM", url, "Header X-Content-Type-Options expected but not found.")
+            elif headers.get("x-content-type-options", "").lower() != "nosniff":
+                self._add_header_issue(grouped, host, "x-content-type-options", "Weak X-Content-Type-Options", "HIGH", url, f"Expected nosniff, observed {headers.get('x-content-type-options')}.")
+
+            if "referrer-policy" not in headers:
+                self._add_header_issue(grouped, host, "referrer-policy", "Missing Referrer-Policy", "MEDIUM", url, "Header Referrer-Policy expected but not found.")
+
+            has_frame_control = "x-frame-options" in headers or "frame-ancestors" in csp.lower()
             if not has_frame_control:
-                missing.append("frame-ancestors/x-frame-options")
-            if len(missing) >= 2:
-                findings.append(
-                    self.make_finding(
-                        "Important browser security headers are missing",
-                        "Security Headers",
-                        "LOW",
-                        "MEDIUM",
-                        "security_headers",
-                        surface,
-                        response,
-                        f"Missing or incomplete headers: {', '.join(missing)}.",
-                        "Missing browser controls can increase impact from content injection, clickjacking, or data leakage.",
-                        "Set a restrictive CSP, X-Content-Type-Options, Referrer-Policy, and frame protection.",
-                        "Repeat the header check and confirm required headers are present on HTML responses.",
-                    )
-                )
+                self._add_header_issue(grouped, host, "frame-protection", "Missing frame protection", "MEDIUM", url, "Expected X-Frame-Options or CSP frame-ancestors but neither was found.")
+
+            if is_main and parsed_target.scheme == "https" and not self._valid_hsts(headers.get("strict-transport-security", "")):
+                observed = headers.get("strict-transport-security", "")
+                reason = "Header Strict-Transport-Security expected on HTTPS main document but not found." if not observed else f"Strict-Transport-Security is invalid: {observed}."
+                self._add_header_issue(grouped, host, "strict-transport-security", "Missing or invalid HSTS", "MEDIUM", url, reason)
+
+        for issue in grouped.values():
+            first_url = issue["affected_urls"][0]
+            response = responses.get(first_url) or {"url": first_url, "status_code": None, "headers": {}}
+            finding = self.make_finding(
+                issue["title"],
+                "Security Headers",
+                "MEDIUM" if issue["confidence"] != "LOW" else "LOW",
+                issue["confidence"],
+                "security_headers",
+                {"id": issue["header"], "url": first_url, "parameters": []},
+                response,
+                f"{issue['evidence']} Affected URLs: {', '.join(issue['affected_urls'][:10])}.",
+                "Missing or weak browser security headers can increase impact from content injection, clickjacking, MIME sniffing, or data leakage.",
+                f"Set a correct {issue['header']} header on the affected HTML responses.",
+                f"Run curl -sI against each affected URL and confirm {issue['header']} is present and valid.",
+            )
+            self._apply_header_evidence(finding, issue)
+            findings.append(finding)
         return findings
 
     async def check_tls_https(self, surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         parsed = urlsplit(self.target.url)
         hostname = parsed.hostname or ""
-        origin_is_http = parsed.scheme == "http"
         is_lab_target = ActiveTargetGate.is_builtin_lab_target(self.target.url) or ActiveTargetGate.is_loopback_host(hostname)
         surface = surfaces[0] if surfaces else {"id": "root", "url": self.target.url, "path": parsed.path or "/", "parameters": []}
-        sid = str(surface.get("id", "root"))
-        response_observed = False
-        status = None
-        ev_id = None
         if not is_lab_target:
-            https_url = self.target.url.replace("http://", "https://", 1)
-            response = await self.client.request(
-                "tls_https", "GET", https_url,
-                surface=sid,
-                safe_test_marker="tls_https_probe",
-            )
-            status = response.get("status_code")
-            response_observed = status is not None
-            ev_id = response.get("_evidence_id")
-            if response_observed and status < 500:
-                return []
-        lab_vulnerable = any(surface.get("vulnerable") for surface in surfaces) and self.authorization_context.get("authorization_status") == "TRAINING"
-        external_http = origin_is_http and not is_lab_target and not response_observed
-        if lab_vulnerable or external_http:
-            fake_resp = {"url": self.target.url, "status_code": None, "headers": {}, "body": "", "_evidence_id": ev_id}
-            return [
-                self.make_finding(
-                    "HTTPS transport enforcement is not demonstrated",
+            tls = await self.probe_tls(hostname, parsed.port or 443)
+            if tls.get("supports_tls12") or tls.get("supports_tls13"):
+                if tls.get("certificate_ok", True):
+                    return []
+                command = f"openssl s_client -connect {hostname}:{parsed.port or 443} -servername {hostname} -tls1_2 </dev/null"
+                diff = f"TLS handshake succeeded, but certificate validation failed: {tls.get('certificate_error')}"
+                fake_resp = {"url": self.target.url, "status_code": None, "headers": {}, "body": "", "method": "OPENSSL"}
+                finding = self.make_finding(
+                    "TLS certificate validation failed",
                     "TLS and HTTPS",
-                    "LOW",
-                    "MEDIUM" if external_http else "POTENTIAL",
+                    "MEDIUM",
+                    "HIGH",
                     "tls_https",
                     surface,
                     fake_resp,
-                    f"HTTPS check: scheme={parsed.scheme}. "
-                    f"{'Lab marks scenario as vulnerable.' if lab_vulnerable else 'External HTTP target could not be reached via HTTPS.'}",
-                    "Credentials and session data should not be sent over cleartext transport outside local training.",
-                    "Serve production targets over HTTPS and deploy HSTS after confirming all subresources use HTTPS.",
-                    "Repeat the scan using the HTTPS origin and confirm HSTS is present where applicable.",
-                    evidence_records=[ev_id] if ev_id else None,
+                    diff,
+                    "Expired, self-signed, or untrusted certificates can break secure transport guarantees.",
+                    "Install a valid certificate from a trusted CA and renew it before expiry.",
+                    "Repeat the OpenSSL command and confirm certificate verification succeeds.",
                 )
-            ]
-        return []
+                self._apply_tls_evidence(finding, command, diff, tls)
+                return [finding]
+            command = f"openssl s_client -connect {hostname}:{parsed.port or 443} -servername {hostname} -tls1_3 </dev/null"
+            diff = f"TLS 1.2 and TLS 1.3 handshakes both failed: tls1.2={tls.get('tls12_error')}; tls1.3={tls.get('tls13_error')}"
+            fake_resp = {"url": self.target.url, "status_code": None, "headers": {}, "body": "", "method": "OPENSSL"}
+            finding = self.make_finding(
+                "TLS 1.2/1.3 handshake could not be established",
+                "TLS and HTTPS",
+                "HIGH",
+                "HIGH",
+                "tls_https",
+                surface,
+                fake_resp,
+                diff,
+                "Clients may be unable to establish modern encrypted transport to this target.",
+                "Enable TLS 1.2 or TLS 1.3 with a valid certificate and supported cipher suites.",
+                "Repeat the OpenSSL TLS 1.2 and TLS 1.3 commands and confirm at least one handshake succeeds.",
+            )
+            self._apply_tls_evidence(finding, command, diff, tls)
+            return [finding]
+        lab_vulnerable = any(surface.get("vulnerable") for surface in surfaces) and self.authorization_context.get("authorization_status") == "TRAINING"
+        if not lab_vulnerable:
+            return []
+        fake_resp = {"url": self.target.url, "status_code": None, "headers": {}, "body": ""}
+        return [
+            self.make_finding(
+                "HTTPS transport enforcement is not demonstrated",
+                "TLS and HTTPS",
+                "LOW",
+                "POTENTIAL",
+                "tls_https",
+                surface,
+                fake_resp,
+                "Lab marks scenario as vulnerable.",
+                "Credentials and session data should not be sent over cleartext transport outside local training.",
+                "Serve production targets over HTTPS and deploy HSTS after confirming all subresources use HTTPS.",
+                "Repeat the scan using the HTTPS origin and confirm HSTS is present where applicable.",
+            )
+        ]
+
+    @staticmethod
+    def _same_origin_path(url: str, expected_url: str, expected_path: str) -> bool:
+        parsed = urlsplit(url)
+        expected = urlsplit(expected_url)
+        return parsed.scheme == expected.scheme and parsed.netloc == expected.netloc and (parsed.path or "/") == expected_path
+
+    @staticmethod
+    def _valid_hsts(value: str) -> bool:
+        if not value:
+            return False
+        match = re.search(r"(?:^|;)\s*max-age\s*=\s*(\d+)", value, re.IGNORECASE)
+        return bool(match and int(match.group(1)) > 0)
+
+    @staticmethod
+    def _weak_csp(value: str) -> bool:
+        lowered = value.lower()
+        return "'unsafe-inline'" in lowered or "*" in lowered or "default-src" not in lowered
+
+    @staticmethod
+    def _add_header_issue(
+        grouped: dict[str, dict[str, Any]],
+        host: str,
+        header: str,
+        title: str,
+        confidence: str,
+        url: str,
+        evidence: str,
+    ) -> None:
+        signature = f"security_headers|{host}|{header}|{title.lower()}"
+        issue = grouped.setdefault(
+            signature,
+            {
+                "title": title,
+                "header": header,
+                "confidence": confidence,
+                "affected_urls": [],
+                "evidence": evidence,
+                "signature": signature,
+            },
+        )
+        if url not in issue["affected_urls"]:
+            issue["affected_urls"].append(url)
+        if confidence == "HIGH":
+            issue["confidence"] = "HIGH"
+        elif issue["confidence"] != "HIGH" and confidence == "MEDIUM":
+            issue["confidence"] = "MEDIUM"
+
+    def _apply_header_evidence(self, finding: dict[str, Any], issue: dict[str, Any]) -> None:
+        url = str(issue["affected_urls"][0])
+        header = str(issue["header"])
+        command = f"curl -sI {_shell_quote(url)} | grep -i {_shell_quote(header)}"
+        diff = (
+            "--- expected\n"
+            f"{header}: <valid value>\n"
+            "+++ observed\n"
+            f"{issue['evidence']}\n"
+            f"Affected URLs: {', '.join(issue['affected_urls'])}"
+        )
+        verification_hash = hashlib.sha256(f"{issue['signature']}|{','.join(issue['affected_urls'])}|{issue['evidence']}".encode("utf-8", errors="ignore")).hexdigest()
+        verification_result = {
+            "confirmed": True,
+            "confidence": issue["confidence"],
+            "confidence_score": finding.get("confidence_score"),
+            "stage": "header_evidence",
+            "method": "header_presence_validation",
+            "payload": header,
+            "evidence_text": issue["evidence"],
+            "reproduction_command": command,
+            "request_response_diff": diff,
+            "verification_hash": verification_hash,
+            "request_id": finding.get("request_id"),
+            "response_status": None,
+            "evidence_ids": finding.get("_evidence_ids", []),
+            "affected_urls": issue["affected_urls"],
+            "evidence_signature": issue["signature"],
+        }
+        finding.update(
+            {
+                "reproduction_command": command,
+                "request_response_diff": diff,
+                "verification_hash": verification_hash,
+                "verification_method": "header_presence_validation",
+                "verification_stage": "header_evidence",
+                "verification_result": verification_result,
+                "affected_urls": issue["affected_urls"],
+                "evidence_signature": issue["signature"],
+            }
+        )
+
+    async def probe_tls(self, hostname: str, port: int = 443) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._probe_tls_sync, hostname, port)
+
+    @staticmethod
+    def _probe_tls_sync(hostname: str, port: int) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "supports_tls12": False,
+            "supports_tls13": False,
+            "certificate_ok": True,
+            "certificate_error": None,
+            "tls12_error": None,
+            "tls13_error": None,
+        }
+
+        def handshake(version: ssl.TLSVersion) -> str | None:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.minimum_version = version
+            context.maximum_version = version
+            with socket.create_connection((hostname, port), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as tls_sock:
+                    return tls_sock.version()
+
+        try:
+            result["tls12_version"] = handshake(ssl.TLSVersion.TLSv1_2)
+            result["supports_tls12"] = True
+        except Exception as exc:
+            result["tls12_error"] = str(exc)[:300]
+
+        if hasattr(ssl.TLSVersion, "TLSv1_3"):
+            try:
+                result["tls13_version"] = handshake(ssl.TLSVersion.TLSv1_3)
+                result["supports_tls13"] = True
+            except Exception as exc:
+                result["tls13_error"] = str(exc)[:300]
+
+        if result["supports_tls12"] or result["supports_tls13"]:
+            try:
+                context = ssl.create_default_context()
+                with socket.create_connection((hostname, port), timeout=5) as sock:
+                    with context.wrap_socket(sock, server_hostname=hostname):
+                        pass
+            except ssl.SSLError as exc:
+                result["certificate_ok"] = False
+                result["certificate_error"] = str(exc)[:300]
+            except Exception as exc:
+                result["certificate_ok"] = False
+                result["certificate_error"] = str(exc)[:300]
+        return result
+
+    def _apply_tls_evidence(self, finding: dict[str, Any], command: str, diff: str, tls: dict[str, Any]) -> None:
+        verification_hash = hashlib.sha256(f"tls_https|{self.target.url}|{diff}|{json.dumps(tls, sort_keys=True, default=str)}".encode("utf-8", errors="ignore")).hexdigest()
+        finding.update(
+            {
+                "reproduction_command": command,
+                "request_response_diff": diff,
+                "verification_hash": verification_hash,
+                "verification_method": "openssl_tls_probe",
+                "verification_stage": "tls_handshake",
+                "verification_result": {
+                    "confirmed": True,
+                    "confidence": finding.get("confidence"),
+                    "confidence_score": finding.get("confidence_score"),
+                    "stage": "tls_handshake",
+                    "method": "openssl_tls_probe",
+                    "payload": command,
+                    "evidence_text": diff,
+                    "reproduction_command": command,
+                    "request_response_diff": diff,
+                    "verification_hash": verification_hash,
+                    "request_id": finding.get("request_id"),
+                    "response_status": None,
+                    "evidence_ids": finding.get("_evidence_ids", []),
+                    "tls": tls,
+                },
+            }
+        )
 
     async def check_sensitive_exposure(self, surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         findings = []
@@ -1651,22 +2673,8 @@ class ActiveSecurityEngine:
                     rate_limit_indicators.append("RateLimit-Remaining")
 
                 if rate_limit_indicators:
-                    findings.append(
-                        self.make_finding(
-                            "Rate limiting is implemented",
-                            "Rate Limiting",
-                            "MEDIUM",
-                            "CONFIRMED",
-                            "rate_limiting",
-                            surface,
-                            response,
-                            f"Rate limiting indicators: {', '.join(rate_limit_indicators)}",
-                            "Rate limiting prevents brute force and DoS attacks.",
-                            "Implement rate limiting per account and per source with documented limits.",
-                            "Repeat the request rapidly and confirm rate limiting triggers.",
-                        )
-                    )
-                elif status in {200, 401, 403}:
+                    await self.emit("control_observed", f"Rate limiting indicators observed: {', '.join(rate_limit_indicators)}", selected_module="rate_limiting", result="CONTROL_PRESENT")
+                elif status in {200, 401, 403} and self.is_login_surface(surface):
                     findings.append(
                         self.make_finding(
                             "Rate limiting appears not implemented",
@@ -1693,43 +2701,41 @@ class ActiveSecurityEngine:
                 path = str(surface.get("path") or surface.get("url") or "")
                 if "/ping" not in path and "/command" not in path and "/execute" not in path:
                     continue
-            sid = str(surface.get("id", ""))
-            test_payloads = ["127.0.0.1; whoami", "127.0.0.1|whoami", "`whoami`", "$(whoami)"]
-            for payload in test_payloads[:2]:
-                try:
-                    response = await self.client.request(
-                        "command_injection", "GET", self.with_parameter(surface, "ip", payload),
-                        surface=sid,
-                        safe_test_marker="command_injection_probe",
-                    )
-                    body = str(response.get("body", "")).lower()
-                    status = response.get("status_code")
-                    if status == 500 or any(indicator in body for indicator in ["uid=", "gid=", "root:", "daemon:"]):
-                        findings.append(
-                            self.make_finding(
-                                "Command injection vulnerability detected",
-                                "Command Injection",
-                                "CRITICAL",
-                                "CONFIRMED",
-                                "command_injection",
-                                surface,
-                                response,
-                                f"Command injection probe returned: status {status}, body contains command output indicators",
-                                "Remote code execution allows full server compromise.",
-                                "Use parameterized queries for commands; never concatenate user input with shell commands.",
-                                "Test with a benign command (e.g., echo test) and confirm it is rejected or sanitized.",
-                                parameter="ip",
-                            )
+            try:
+                verification = await self.verifier.verify_command_timing(surface, "ip")
+                if verification.confirmed:
+                    findings.append(
+                        self.make_finding(
+                            "Command injection vulnerability detected",
+                            "Command Injection",
+                            "CRITICAL",
+                            verification.confidence,
+                            "command_injection",
+                            surface,
+                            {"url": self.with_parameter(surface, "ip", verification.payload), "status_code": 200},
+                            verification.evidence_text,
+                            "Remote code execution allows full server compromise.",
+                            "Avoid shell invocation with user input; use safe APIs, argument arrays, allowlists, and timeouts.",
+                            "Repeat the benign timing proof and confirm the delayed branch is impossible after remediation.",
+                            parameter="ip",
+                            evidence_records=verification.evidence_ids,
+                            verification_result=verification,
                         )
-                        break
-                except Exception as exc:
-                    logger.warning("Command injection check failed for surface %s: %s", sid, exc)
+                    )
+            except Exception as exc:
+                logger.warning("Command injection check failed for surface %s: %s", str(surface.get("id") or surface.get("path") or ""), exc)
         return findings
 
     async def check_ssti(self, surfaces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         findings = []
         for surface in surfaces[:1]:
             ssti_payloads = ["{{7*7}}", "${7*7}", "#{7*7}", "<%= 7*7 %>"]
+            control_response = await self.client.request(
+                "ssti", "GET", self.with_parameter(surface, "name", "PHANTOMSCAN_SSTI_CONTROL"),
+                surface=str(surface.get("id", "")),
+                safe_test_marker="ssti_control",
+            )
+            control_body = str(control_response.get("body", ""))
             for payload in ssti_payloads[:2]:
                 try:
                     response = await self.client.request(
@@ -1738,7 +2744,7 @@ class ActiveSecurityEngine:
                         safe_test_marker="ssti_probe",
                     )
                     body = str(response.get("body", ""))
-                    if "49" in body:
+                    if "49" in body and payload not in body and "49" not in control_body:
                         findings.append(
                             self.make_finding(
                                 "Server-Side Template Injection detected",
@@ -1789,22 +2795,6 @@ class ActiveSecurityEngine:
                             "Test with a benign XML entity and confirm it is rejected.",
                         )
                     )
-                else:
-                    findings.append(
-                        self.make_finding(
-                            "XXE protection likely present",
-                            "XXE",
-                            "LOW",
-                            "MEDIUM",
-                            "xxe",
-                            surface,
-                            response,
-                            "No file content returned with XXE probe; possible protection.",
-                            "Missing XXE protection could lead to file disclosure or SSRF.",
-                            "Ensure XML parsers reject external entities and use secure configurations.",
-                            "Test with a benign XXE attempt and confirm rejection.",
-                        )
-                    )
             except Exception as exc:
                 logger.warning("XXE check failed for surface %s: %s", str(surface.get("id") or surface.get("path") or ""), exc)
         return findings
@@ -1827,7 +2817,7 @@ class ActiveSecurityEngine:
                     )
                     body = str(response.get("body", "")).lower()
                     status = response.get("status_code")
-                    if status == 200 or ("meta-data" in body or "root:" in body or "ssh" in body):
+                    if "meta-data" in body or "root:" in body or "ssh" in body:
                         findings.append(
                             self.make_finding(
                                 "Server-Side Request Forgery (SSRF) detected",
@@ -1919,22 +2909,6 @@ class ActiveSecurityEngine:
                         break
                 except Exception as exc:
                     logger.warning("Info disclosure check failed for surface %s: %s", str(surface.get("id") or surface.get("path") or "", exc))
-            if not findings:
-                findings.append(
-                    self.make_finding(
-                        "Sensitive file exposure appears mitigated",
-                        "Sensitive Exposure",
-                        "LOW",
-                        "MEDIUM",
-                        "sensitive_exposure",
-                        surface,
-                        {"url": self.target.url, "status_code": None, "headers": {}, "body": ""},
-                        "Sensitive paths returned 404 or error, suggesting protection.",
-                        "Missing protection could expose configuration or secrets.",
-                        "Ensure .env, .git, and diagnostic files are not accessible.",
-                        "Test with a benign path and confirm it returns content.",
-                    )
-                )
         return findings
 
     async def emit(
@@ -1975,7 +2949,7 @@ class ActiveSecurityEngine:
         title: str,
         category: str,
         severity: str,
-        confidence: str,
+        confidence: str | float,
         module: str,
         surface: dict[str, Any],
         response: dict[str, Any],
@@ -1986,23 +2960,63 @@ class ActiveSecurityEngine:
         *,
         parameter: str | None = None,
         evidence_records: list[int] | None = None,
+        verification_result: VerificationResult | None = None,
     ) -> dict[str, Any]:
         endpoint = str(response.get("url") or surface.get("url") or surface.get("path") or self.target.url)
         response_status = response.get("status_code")
         response_observed = response_status is not None
-        request_id = response.get("_request_id", "")
-        has_evidence = bool(request_id) and response_observed
-        used_confidence = confidence if has_evidence else "LOW"
-        used_confidence = "CONFIRMED" if (has_evidence and confidence in ("CONFIRMED", "HIGH")) else used_confidence
+        request_id = str(response.get("_request_id") or (verification_result.request_id if verification_result else "") or uuid.uuid4().hex[:8])
+        has_evidence = (bool(request_id) and response_observed) or bool(verification_result and verification_result.evidence_ids)
+        confidence_score = self.confidence_score(verification_result, confidence, has_evidence)
+        confidence_label = self.confidence_label(confidence_score)
+        used_confidence = confidence_label if has_evidence else "LOW"
+        used_severity = self.derived_severity(module, severity, confidence_score)
+        reproduction_command = (
+            verification_result.reproduction_command
+            if verification_result
+            else build_curl_command(str(response.get("method") or "GET"), endpoint)
+        )
+        verification_hash = verification_result.verification_hash if verification_result else hashlib.sha256(
+            f"{module}|{endpoint}|{parameter or ''}|{request_id}|{ev_text}".encode("utf-8", errors="ignore")
+        ).hexdigest()
+        request_response_diff = verification_result.request_response_diff if verification_result else (
+            "--- request\n"
+            f"+++ request\nEndpoint: {endpoint}\nParameter: {parameter or self.first_parameter(surface, '')}\n"
+            "--- response\n"
+            f"+++ response\nStatus: {response_status}\nEvidence: {ev_text[:1000]}"
+        )
+        verification_payload = asdict(verification_result) if verification_result else {
+            "confirmed": has_evidence,
+            "confidence": used_confidence,
+            "confidence_score": confidence_score,
+            "stage": "observed_response" if response_observed else "unverified",
+            "method": "response_evidence",
+            "payload": "",
+            "evidence_text": ev_text,
+            "reproduction_command": reproduction_command,
+            "request_response_diff": request_response_diff,
+            "verification_hash": verification_hash,
+            "request_id": request_id,
+            "response_status": response_status,
+            "evidence_ids": list(evidence_records or []),
+        }
         evidence_note = f"Evidence request_id: {request_id}. " if request_id else "No request evidence recorded. "
         evidence_note += f"HTTP status: {response_status}. Surface: {surface.get('id', 'unknown')}."
+        evidence_note += f" Validation: {ev_text}"
+        if verification_result:
+            evidence_note += (
+                f" Verification stage: {verification_result.stage}."
+                f" Method: {verification_result.method}."
+                f" Confidence score: {confidence_score:.2f}."
+                f" Verification hash: {verification_result.verification_hash}."
+            )
         if not response_observed:
             evidence_note += " No response received."
             evidence_note += f" Error: {response.get('error', 'unknown')}" if response.get("error") else ""
         finding = build_finding(
             title=title,
             category=category,
-            severity=severity,
+            severity=used_severity,
             confidence=used_confidence,
             target=self.target.url,
             endpoint=endpoint,
@@ -2019,17 +3033,101 @@ class ActiveSecurityEngine:
                 "recommended_fix": recommendation,
                 "remediation_status": "OPEN",
                 "verification_status": "NOT_VERIFIED",
+                "request_id": request_id,
+                "confidence_score": confidence_score,
+                "confidence_label": confidence_label,
+                "reproduction_command": reproduction_command,
+                "request_response_diff": request_response_diff,
+                "verification_hash": verification_hash,
+                "verification_method": verification_result.method if verification_result else verification_payload["method"],
+                "verification_stage": verification_result.stage if verification_result else verification_payload["stage"],
+                "verification_result": verification_payload,
+                "source_correlation": self.source_correlation_for(surface, module, parameter or self.first_parameter(surface, "")),
+                "scan_id": self.scan_id,
             }
         )
+        if verification_result:
+            finding.update(
+                {
+                    "poc": {
+                        "payload": verification_result.payload,
+                        "method": verification_result.method,
+                        "confirmed": verification_result.confirmed,
+                    },
+                }
+            )
         if not response_observed and not has_evidence:
             finding.update({
                 "confidence": "LOW",
                 "evidence": f"{ev_text} No real HTTP response was recorded. {evidence_note}",
             })
-        finding["_evidence_ids"] = evidence_records or []
+        finding["_evidence_ids"] = list(evidence_records or [])
+        if response.get("_evidence_id") and response.get("_evidence_id") not in finding["_evidence_ids"]:
+            finding["_evidence_ids"].append(response.get("_evidence_id"))
         finding["_request_id"] = request_id
         finding["_evidence_id"] = response.get("_evidence_id")
         return finding
+
+    def source_correlation_for(self, surface: dict[str, Any], module: str, parameter: str | None) -> dict[str, Any] | None:
+        embedded = surface.get("source_correlation")
+        if isinstance(embedded, dict):
+            return embedded
+        if surface.get("file_path") or surface.get("code_snippet"):
+            return {
+                "reachable": True,
+                "indicator": "reachable_from_code",
+                "file_path": surface.get("file_path"),
+                "line_number": surface.get("line_number"),
+                "code_snippet": surface.get("code_snippet"),
+                "parameter": parameter,
+            }
+        sinks = self._dangerous_sinks()
+        parameter_text = str(parameter or "").lower()
+        for sink in sinks:
+            sink_text = f"{sink.get('sink')} {sink.get('code_snippet')}".lower()
+            if parameter_text and parameter_text in sink_text:
+                return {**sink, "reachable": True, "indicator": "reachable_from_code", "parameter": parameter}
+        return {"reachable": False, "indicator": "unreachable_or_not_mapped", "parameter": parameter} if parameter else None
+
+    def _dangerous_sinks(self) -> list[dict[str, Any]]:
+        if self._sink_cache is not None:
+            return self._sink_cache
+        root = Path(get_settings().clone_dir)
+        if not root.exists() or not root.is_dir():
+            self._sink_cache = []
+            return self._sink_cache
+        sink_re = re.compile(r"\b(exec|query|execute|innerHTML|dangerouslySetInnerHTML|document\.write|os\.system|subprocess)\b")
+        suffixes = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".php", ".rb", ".go"}
+        sinks: list[dict[str, Any]] = []
+        scanned = 0
+        try:
+            for path in root.rglob("*"):
+                if scanned >= 2000 or len(sinks) >= 200:
+                    break
+                if not path.is_file() or path.suffix.lower() not in suffixes:
+                    continue
+                scanned += 1
+                try:
+                    for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+                        match = sink_re.search(line)
+                        if not match:
+                            continue
+                        sinks.append(
+                            {
+                                "file_path": str(path.relative_to(root)),
+                                "line_number": line_number,
+                                "code_snippet": line.strip()[:500],
+                                "sink": match.group(1),
+                            }
+                        )
+                        if len(sinks) >= 200:
+                            break
+                except OSError:
+                    continue
+        except OSError:
+            sinks = []
+        self._sink_cache = sinks
+        return self._sink_cache
 
     def final_report(self, status: str, error: str | None) -> str:
         lines = [
@@ -2090,10 +3188,150 @@ class ActiveSecurityEngine:
         query[parameter] = value
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(query), ""))
 
+    async def baseline_response(self, module: str, surface: dict[str, Any], parameter: str, control_value: str) -> dict[str, Any]:
+        target = self.surface_target(surface)
+        parsed = urlsplit(urljoin(f"{self.target.origin}/", target) if target.startswith("/") else target)
+        key = (module, str(surface.get("method") or "GET").upper(), parsed.path or "/")
+        cached = self._baseline_cache.get(key)
+        if cached is not None:
+            return cached
+        response = await self.client.request(
+            module,
+            "GET",
+            self.with_parameter(surface, parameter, control_value),
+            surface=str(surface.get("id", "")),
+            safe_test_marker=control_value,
+        )
+        self._baseline_cache[key] = response
+        return response
+
+    def select_best_parameter(
+        self,
+        surface: dict[str, Any],
+        *,
+        default: str | None = None,
+        vulnerability_type: str = "",
+    ) -> str | None:
+        candidates: dict[str, str] = {}
+
+        def add(name: Any, value: Any = "") -> None:
+            text = str(name or "").strip()
+            if text and text not in candidates:
+                candidates[text] = str(value or "")
+
+        for parameter in surface.get("parameters") or []:
+            if isinstance(parameter, dict):
+                add(parameter.get("name") or parameter.get("key"), parameter.get("value") or parameter.get("example"))
+            else:
+                add(parameter)
+        for key in ("query", "query_params", "body", "body_params", "body_parameters", "path_params", "path_parameters"):
+            value = surface.get(key)
+            if isinstance(value, dict):
+                for name, param_value in value.items():
+                    add(name, param_value)
+            elif isinstance(value, list):
+                for parameter in value:
+                    if isinstance(parameter, dict):
+                        add(parameter.get("name") or parameter.get("key"), parameter.get("value") or parameter.get("example"))
+                    else:
+                        add(parameter)
+        target = self.surface_target(surface)
+        for name, value in parse_qsl(urlsplit(target).query, keep_blank_values=True):
+            add(name, value)
+
+        if not candidates:
+            return default
+
+        common_impact = {"id", "user", "username", "file", "url", "q", "redirect", "path", "next", "return"}
+        attack_hints = {
+            "injection": {"customer", "account", "account_number", "id", "user", "username", "search", "query", "q", "filter", "sort", "where"},
+            "xss": {"q", "search", "query", "message", "comment", "name", "title", "redirect", "next", "return", "url"},
+        }.get(vulnerability_type, set())
+
+        def score(item: tuple[str, str]) -> tuple[int, int, str]:
+            parameter, value = item
+            lower = parameter.lower()
+            value_text = str(value or "")
+            points = 0
+            if lower in attack_hints:
+                points += 70
+            if vulnerability_type == "injection" and lower == "customer":
+                points += 50
+            if vulnerability_type == "injection" and lower == "id" and not value_text:
+                points -= 25
+            if vulnerability_type == "injection" and lower == "q":
+                points -= 35
+            if lower in common_impact:
+                points += 35
+            if any(token in lower for token in attack_hints):
+                points += 15
+            if value_text and not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value_text.strip()):
+                points += 25
+            if len(value_text) >= 4:
+                points += 10
+            if not re.search(r"(?:^|_)(count|page|limit|offset|size|num|number)(?:$|_)", lower):
+                points += 10
+            if len(parameter) >= 4:
+                points += 5
+            return (points, len(value_text), parameter)
+
+        return max(candidates.items(), key=score)[0]
+
     @staticmethod
     def first_parameter(surface: dict[str, Any], default: str) -> str:
         parameters = surface.get("parameters") or []
         return str(parameters[0]) if parameters else default
+
+    @staticmethod
+    def confidence_score(verification_result: VerificationResult | None, confidence: str | float, has_evidence: bool) -> float:
+        if not has_evidence:
+            return 0.2
+        if verification_result is not None:
+            return max(0.0, min(1.0, float(verification_result.confidence_score)))
+        if isinstance(confidence, (int, float)):
+            return max(0.0, min(1.0, float(confidence)))
+        return {"CONFIRMED": 0.99, "HIGH": 0.91, "MEDIUM": 0.65, "LOW": 0.35, "POTENTIAL": 0.2}.get(str(confidence).upper(), 0.5)
+
+    @staticmethod
+    def confidence_label(confidence_score: float) -> str:
+        settings = get_settings()
+        high = max(0.0, min(1.0, float(settings.confidence_high)))
+        medium = max(0.0, min(high, float(settings.confidence_medium)))
+        if confidence_score >= high:
+            return "HIGH"
+        if confidence_score >= medium:
+            return "MEDIUM"
+        return "LOW"
+
+    def confidence_label_for_scan(self, confidence_score: float) -> str:
+        high = max(0.0, min(1.0, float(self.confidence_high_threshold)))
+        medium = max(0.0, min(high, float(self.confidence_medium_threshold)))
+        if confidence_score >= high:
+            return "HIGH"
+        if confidence_score >= medium:
+            return "MEDIUM"
+        return "LOW"
+
+    @staticmethod
+    def derived_severity(module: str, original: str, confidence_score: float) -> str:
+        normalized = normalize_module(module)
+        if normalized == "injection":
+            return "CRITICAL" if confidence_score >= get_settings().confidence_high else "HIGH"
+        if normalized == "xss":
+            return "HIGH" if confidence_score >= get_settings().confidence_high else "MEDIUM"
+        if normalized == "command_injection":
+            return "CRITICAL" if confidence_score >= get_settings().confidence_high else "HIGH"
+        return str(original or "INFO").upper()
+
+    def derived_severity_for_scan(self, module: str, original: str, confidence_score: float) -> str:
+        normalized = normalize_module(module)
+        if normalized == "injection":
+            return "CRITICAL" if confidence_score >= self.confidence_high_threshold else "HIGH"
+        if normalized == "xss":
+            return "HIGH" if confidence_score >= self.confidence_high_threshold else "MEDIUM"
+        if normalized == "command_injection":
+            return "CRITICAL" if confidence_score >= self.confidence_high_threshold else "HIGH"
+        return str(original or "INFO").upper()
 
 
 def score_findings(findings: list[dict[str, Any]], surface_count: int = 0) -> dict[str, Any]:

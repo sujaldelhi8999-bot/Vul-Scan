@@ -25,6 +25,7 @@ import {
   formatDateTime,
   latestCompletedScan,
   relativeTime,
+  scanDisplayTimestamp,
   securityScore,
   targetName,
 } from '../../utils/derived';
@@ -68,7 +69,7 @@ export default function DashboardPage() {
     <Page>
       <PageHeader
         title="Security Overview"
-        description={latestScan ? `Last assessed ${relativeTime(latestScan.created_at)}` : 'Run your first scan to establish a baseline.'}
+        description={latestScan ? `Last assessed ${relativeTime(scanDisplayTimestamp(latestScan))}` : 'Run your first scan to establish a baseline.'}
         action={
           <div className="flex gap-2">
             <Link to="/scan"><Button variant="primary">Start Defend Scan</Button></Link>
@@ -185,7 +186,7 @@ export default function DashboardPage() {
             </div>
             {latestScan ? (
               <div className="flex gap-3 text-[10px] text-[var(--text-muted)] font-medium">
-                <span className="font-mono">{formatDateTime(latestScan.created_at)}</span>
+                <span className="font-mono">{formatDateTime(scanDisplayTimestamp(latestScan))}</span>
                 <span className="capitalize">{latestScan.mode}</span>
                 <StatusBadge status={latestScan.status} />
               </div>
@@ -212,7 +213,7 @@ export default function DashboardPage() {
             <div className="px-3 py-1.5 bg-white">
               {findings.length ? (
                 <div className="divide-y divide-[var(--border-light)]">
-                  {findings.slice(-7).reverse().map((finding) => (
+                  {findings.slice(0, 7).map((finding) => (
                     <Link
                       key={finding.id}
                       to="/findings"

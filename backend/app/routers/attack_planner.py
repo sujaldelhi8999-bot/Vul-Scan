@@ -13,9 +13,11 @@ router = APIRouter(prefix="/api/attack-planner", tags=["Attack Planner"])
 
 class PlanRequest(BaseModel):
     target_url: str = Field(min_length=4, max_length=2048)
+    scan_id: int | None = None
     tech_stack: dict | None = None
     open_ports: list[int] | None = None
     findings: list[dict] | None = None
+    entry_points: list[dict] | None = None
 
 
 class QuickScanRequest(BaseModel):
@@ -34,9 +36,11 @@ async def generate_attack_plan(
     planner = AttackPlanner()
     plan = await planner.generate_plan(
         target_url=req.target_url,
+        scan_id=req.scan_id,
         tech_stack=req.tech_stack,
         open_ports=req.open_ports,
         findings=req.findings,
+        entry_points=req.entry_points,
     )
     return {
         "target": plan.target,

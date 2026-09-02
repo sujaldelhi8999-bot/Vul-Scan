@@ -5,6 +5,7 @@ Ported from VULSCAN/backend/services/scanner_engine.py.
 """
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -49,6 +50,21 @@ SKIP_FILES = {
 }
 
 MAX_FILE_SIZE = 1_000_000  # 1MB
+
+
+def _excluded_by_pattern(file_path: Path, target: Path, exclude_patterns: list[str]) -> bool:
+    try:
+        rel = file_path.relative_to(target if target.is_dir() else target.parent).as_posix()
+    except ValueError:
+        rel = file_path.as_posix()
+    name = file_path.name
+    for raw_pattern in exclude_patterns:
+        pattern = raw_pattern.strip().replace("\\", "/").lstrip("./")
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern) or Path(rel).match(pattern):
+            return True
+    return False
 
 
 CONTEXT_AWARE_RULES: dict[str, dict[str, Any]] = {
@@ -188,18 +204,19 @@ class RuleScanner:
                 applicable.append(rule)
         return applicable
 
-    def _collect_files(self, target_path: str) -> list[Path]:
+    def _collect_files(self, target_path: str, exclude_patterns: list[str] | None = None) -> list[Path]:
         files = []
         target = Path(target_path)
+        excludes = exclude_patterns or []
         if target.is_file():
-            if self._should_scan_file(target):
+            if self._should_scan_file(target) and not _excluded_by_pattern(target, target, excludes):
                 files.append(target)
             return files
         for root, dirs, filenames in os.walk(target):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             for filename in filenames:
                 file_path = Path(root) / filename
-                if self._should_scan_file(file_path):
+                if self._should_scan_file(file_path) and not _excluded_by_pattern(file_path, target, excludes):
                     files.append(file_path)
         return files
 
@@ -307,12 +324,12 @@ class RuleScanner:
                         })
         return findings
 
-    async def scan(self, path: str, sensitivity: str = "medium") -> list[dict[str, Any]]:
+    async def scan(self, path: str, sensitivity: str = "medium", exclude_patterns: list[str] | None = None) -> list[dict[str, Any]]:
         """Scan a directory or file for security issues using regex rules."""
         start = time.time()
         if not path or not os.path.exists(path):
             return []
-        files = self._collect_files(path)
+        files = self._collect_files(path, exclude_patterns)
         if not files:
             return []
         rules = self._rules

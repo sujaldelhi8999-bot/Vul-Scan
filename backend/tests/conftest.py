@@ -1,11 +1,66 @@
 import os
-import pytest
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
 from fastapi.testclient import TestClient
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+_test_db_dir: str | None = None
+_test_db_path: Path | None = None
+
+
+def _sqlite_files(path: Path) -> list[Path]:
+    return [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
 
 
 def pytest_configure(config):
-    """Set required env vars before any test imports app."""
+    """Set required env vars before any test imports app.
+
+    Tests always run against an isolated SQLite database, regardless of any
+    developer or CI DATABASE_URL value. This prevents test runs from touching a
+    local PhantomScan database and matches the active runtime storage layer.
+    """
+    global _test_db_dir, _test_db_path
     os.environ.setdefault("SECRET_KEY", "test-secret-key-for-testing-only-123456789012345678901234")
+    configured_url = os.environ.get("PHANTOMSCAN_TEST_DATABASE_URL")
+    if configured_url:
+        if not configured_url.startswith("sqlite:///"):
+            raise RuntimeError("PHANTOMSCAN_TEST_DATABASE_URL must use sqlite:/// for the current test runtime")
+        _test_db_path = Path(configured_url.replace("sqlite:///", "")).resolve()
+        _test_db_path.parent.mkdir(parents=True, exist_ok=True)
+        for file_path in _sqlite_files(_test_db_path):
+            file_path.unlink(missing_ok=True)
+        os.environ["DATABASE_URL"] = f"sqlite:///{_test_db_path}"
+        return
+
+    _test_db_dir = tempfile.mkdtemp(prefix="phantomscan-tests-")
+    _test_db_path = Path(_test_db_dir) / "test.db"
+    os.environ["DATABASE_URL"] = f"sqlite:///{_test_db_path}"
+
+
+def pytest_unconfigure(config):
+    """Remove isolated SQLite test database files."""
+    try:
+        import asyncio
+        from app.database import close_database
+        asyncio.run(close_database())
+    except Exception:
+        pass
+    if _test_db_path is not None:
+        for file_path in _sqlite_files(_test_db_path):
+            try:
+                file_path.unlink(missing_ok=True)
+            except PermissionError:
+                # On Windows, SQLite handles can briefly remain locked after a
+                # failed async TestClient run. Do not mask the real test result.
+                pass
+    if _test_db_dir:
+        shutil.rmtree(_test_db_dir, ignore_errors=True)
 
 
 def create_auth_headers(client: TestClient, email: str = None, password: str = "TestPass123!") -> dict:

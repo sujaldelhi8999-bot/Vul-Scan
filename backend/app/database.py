@@ -1,11 +1,16 @@
 import asyncio
 import json
 import logging
+import math
+import re
+import threading
+import weakref
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import urlparse
 
 import aiosqlite
 
@@ -16,28 +21,71 @@ from app.models import FindingCreate
 from app.security import redact_payload, redact_sensitive
 
 SYSTEM_TARGET_URL = "system://phantomscan"
-LATEST_SCHEMA_VERSION = 16
+LATEST_SCHEMA_VERSION = 17
 _UNSET = object()
-_db_lock = asyncio.Lock()
-_db_connection: aiosqlite.Connection | None = None
+_lock_registry_guard = threading.Lock()
+_db_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
+_write_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
 
 
-async def _ensure_connection() -> aiosqlite.Connection:
-    global _db_connection
-    if _db_connection is None or _db_connection._connection is None:
-        _db_connection = await aiosqlite.connect(DATABASE_PATH)
-        _db_connection.row_factory = aiosqlite.Row
-        await _db_connection.execute("PRAGMA foreign_keys = ON")
-        await _db_connection.execute("PRAGMA journal_mode = WAL")
-        await _db_connection.execute("PRAGMA busy_timeout = 30000")
-    return _db_connection
+def _lock_for_current_loop(
+    registry: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock],
+) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    with _lock_registry_guard:
+        lock = registry.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            registry[loop] = lock
+        return lock
+
+
+def _db_lock() -> asyncio.Lock:
+    return _lock_for_current_loop(_db_locks)
+
+
+def _write_lock() -> asyncio.Lock:
+    return _lock_for_current_loop(_write_locks)
+
+
+def safe_int(value: Any, default: int | None = None) -> int | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value.is_integer() else default
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            return int(text)
+    return default
+
+
+async def _open_connection() -> aiosqlite.Connection:
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = await aiosqlite.connect(DATABASE_PATH, timeout=30.0)
+    try:
+        connection.row_factory = aiosqlite.Row
+        await connection.execute("PRAGMA foreign_keys = ON")
+        await connection.execute("PRAGMA journal_mode = WAL")
+        await connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
+    except Exception:
+        await connection.close()
+        raise
 
 
 def resolve_database_path() -> Path:
     database_url = get_settings().database_url
     prefix = "sqlite:///"
     if not database_url.startswith(prefix):
-        raise ValueError("DATABASE_URL must use the sqlite:/// URL format")
+        raise ValueError(
+            "Unsupported DATABASE_URL. The current PhantomScan runtime persistence layer "
+            "uses SQLite via backend/app/database.py, so DATABASE_URL must use the "
+            "sqlite:/// URL format. PostgreSQL/SQLAlchemy files in app/database_orm are "
+            "future migration infrastructure and are not active runtime storage yet."
+        )
     configured_path = Path(database_url[len(prefix) :])
     if not configured_path.is_absolute():
         configured_path = BASE_DIR / configured_path
@@ -135,6 +183,16 @@ CREATE TABLE IF NOT EXISTS findings (
     remediation_status TEXT NOT NULL DEFAULT 'OPEN' CHECK (remediation_status IN ('OPEN', 'IN_PROGRESS', 'RESOLVED')),
     verification_status TEXT NOT NULL DEFAULT 'NOT_VERIFIED' CHECK (verification_status IN ('NOT_VERIFIED', 'FIX_VERIFIED', 'ISSUE_STILL_PRESENT', 'VERIFY_FAILED')),
     risk_status TEXT NOT NULL DEFAULT 'ACTIVE',
+    request_id TEXT,
+    confidence_score REAL CHECK (confidence_score IS NULL OR (confidence_score >= 0 AND confidence_score <= 1)),
+    confidence_label TEXT,
+    reproduction_command TEXT,
+    request_response_diff TEXT,
+    verification_hash TEXT,
+    verification_method TEXT,
+    verification_stage TEXT,
+    verification_result TEXT,
+    source_correlation TEXT,
     FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
 );
 
@@ -170,6 +228,11 @@ CREATE TABLE IF NOT EXISTS scan_artifacts (
     exploitation_output TEXT,
     tci_output TEXT,
     ai_consultation TEXT,
+    vuln_findings TEXT,
+    verified_findings TEXT,
+    attack_graph TEXT,
+    attack_paths TEXT,
+    path_validations TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
 );
@@ -203,6 +266,21 @@ CREATE TABLE IF NOT EXISTS scan_event_logs (
 
 CREATE INDEX IF NOT EXISTS idx_scan_event_logs_scan_id ON scan_event_logs (scan_id);
 CREATE INDEX IF NOT EXISTS idx_scan_event_logs_event_type ON scan_event_logs (event_type);
+
+CREATE TABLE IF NOT EXISTS candidate_rejections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id INTEGER NOT NULL,
+    module TEXT NOT NULL,
+    endpoint TEXT NOT NULL DEFAULT '',
+    parameter TEXT,
+    reason TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (scan_id) REFERENCES scans (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_rejections_scan_id ON candidate_rejections (scan_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_rejections_reason ON candidate_rejections (reason);
 
 CREATE TABLE IF NOT EXISTS audit_log_categories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -703,18 +781,34 @@ SCANS_MODE_LEGACY_MARKER = "CHECK (mode IN ('defend', 'pentest'))"
 
 @asynccontextmanager
 async def get_connection() -> AsyncIterator[aiosqlite.Connection]:
-    async with _db_lock:
-        connection = await _ensure_connection()
-    for attempt in range(3):
-        try:
-            yield connection
-            return
-        except aiosqlite.OperationalError as exc:
-            if "database is locked" not in str(exc).lower() or attempt == 2:
+    async with _db_lock():
+        connection = await _open_connection()
+    try:
+        yield connection
+    except Exception:
+        if connection.in_transaction:
+            await connection.rollback()
+        raise
+    finally:
+        await connection.close()
+
+
+@asynccontextmanager
+async def get_write_connection() -> AsyncIterator[aiosqlite.Connection]:
+    async with _write_lock():
+        async with get_connection() as connection:
+            try:
+                yield connection
+            except Exception:
+                if connection.in_transaction:
+                    await connection.rollback()
                 raise
-            delay = 0.1 * (2 ** attempt)
-            logger.debug("DB locked, retry %d in %.1fs", attempt + 1, delay)
-            await asyncio.sleep(delay)
+
+
+async def close_database() -> None:
+    async with _write_lock():
+        async with _db_lock():
+            pass
 
 
 def serialize_row(row: Any | None) -> dict[str, Any] | None:
@@ -805,12 +899,12 @@ async def _migrate_scans_mode_check(connection: aiosqlite.Connection) -> None:
         create_new
         + f"""
         INSERT INTO scans_new (
-            id, target_url, mode, intensity, selected_tests, user_id, {enterprise_select}, authorization_id,
+            id, target_url, mode, intensity, selected_tests, user_id, enterprise_id, authorization_id,
             authorization_confirmed, status, progress, request_count, sandbox_id,
             error_message, created_at, started_at, completed_at
         )
         SELECT
-            id, target_url, mode, intensity, selected_tests, user_id, enterprise_id, authorization_id,
+            id, target_url, mode, intensity, selected_tests, user_id, {enterprise_select}, authorization_id,
             authorization_confirmed, status, progress, request_count, sandbox_id,
             error_message, created_at, started_at, completed_at
         FROM scans;
@@ -823,7 +917,7 @@ async def _migrate_scans_mode_check(connection: aiosqlite.Connection) -> None:
 
 
 async def initialize_database() -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         if not await _table_exists(connection, "scans"):
             await connection.executescript(SCHEMA_SQL)
             await connection.execute(f"PRAGMA user_version = {LATEST_SCHEMA_VERSION}")
@@ -843,6 +937,8 @@ async def initialize_database() -> None:
         await _migrate_browser_artifact_columns(connection)
         await _migrate_exploitation_artifact_column(connection)
         await _migrate_tci_artifact_column(connection)
+        await _migrate_finding_artifact_columns(connection)
+        await _migrate_attack_graph_artifact_columns(connection)
         await _migrate_ai_columns(connection)
         await _migrate_authorized_test_jobs_table(connection)
         await _migrate_job_events_table(connection)
@@ -956,6 +1052,16 @@ async def _migrate_active_finding_columns(connection: aiosqlite.Connection) -> N
         ("recommended_fix", "TEXT"),
         ("remediation_status", "TEXT NOT NULL DEFAULT 'OPEN'"),
         ("verification_status", "TEXT NOT NULL DEFAULT 'NOT_VERIFIED'"),
+        ("request_id", "TEXT"),
+        ("confidence_score", "REAL"),
+        ("confidence_label", "TEXT"),
+        ("reproduction_command", "TEXT"),
+        ("request_response_diff", "TEXT"),
+        ("verification_hash", "TEXT"),
+        ("verification_method", "TEXT"),
+        ("verification_stage", "TEXT"),
+        ("verification_result", "TEXT"),
+        ("source_correlation", "TEXT"),
     ]
     for column, definition in columns:
         if not await _column_exists(connection, "findings", column):
@@ -997,6 +1103,18 @@ async def _migrate_exploitation_artifact_column(connection: aiosqlite.Connection
 async def _migrate_tci_artifact_column(connection: aiosqlite.Connection) -> None:
     if not await _column_exists(connection, "scan_artifacts", "tci_output"):
         await connection.execute("ALTER TABLE scan_artifacts ADD COLUMN tci_output TEXT")
+
+
+async def _migrate_finding_artifact_columns(connection: aiosqlite.Connection) -> None:
+    for column in ("vuln_findings", "verified_findings"):
+        if not await _column_exists(connection, "scan_artifacts", column):
+            await connection.execute(f"ALTER TABLE scan_artifacts ADD COLUMN {column} TEXT")
+
+
+async def _migrate_attack_graph_artifact_columns(connection: aiosqlite.Connection) -> None:
+    for column in ("attack_graph", "attack_paths", "path_validations"):
+        if not await _column_exists(connection, "scan_artifacts", column):
+            await connection.execute(f"ALTER TABLE scan_artifacts ADD COLUMN {column} TEXT")
 
 
 async def _migrate_users_enterprise(connection: aiosqlite.Connection) -> None:
@@ -1813,7 +1931,7 @@ async def create_scan(
     max_duration_minutes: int = 120,
     enterprise_id: str | None = None,
 ) -> int:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO scans (
@@ -1838,7 +1956,7 @@ async def create_scan(
 
 
 async def get_or_create_system_scan() -> int:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             "SELECT id FROM scans WHERE target_url = ? ORDER BY id ASC LIMIT 1",
             (SYSTEM_TARGET_URL,),
@@ -1863,7 +1981,7 @@ async def get_scan(scan_id: int) -> dict[str, Any] | None:
         return serialize_row(await cursor.fetchone())
 
 
-async def list_scans(user_id: str | None = None, enterprise_id: str | None = None) -> list[dict[str, Any]]:
+async def list_scans(user_id: str | None = None, enterprise_id: str | None = None, limit: int = 20, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
     count_columns = """
         s.*,
         COALESCE(COUNT(f.id), 0) AS findings_count,
@@ -1886,9 +2004,23 @@ async def list_scans(user_id: str | None = None, enterprise_id: str | None = Non
                 WHERE s.enterprise_id = ? AND s.target_url != ?
                 GROUP BY s.id
                 ORDER BY s.created_at DESC, s.id DESC
-                LIMIT 100
                 """,
                 (enterprise_id, SYSTEM_TARGET_URL),
+            )
+            total_rows = await cursor.fetchone()
+            total = total_rows[0] if total_rows else 0
+
+            cursor = await connection.execute(
+                f"""
+                SELECT {count_columns}
+                FROM scans s
+                LEFT JOIN findings f ON f.scan_id = s.id
+                WHERE s.enterprise_id = ? AND s.target_url != ?
+                GROUP BY s.id
+                ORDER BY s.created_at DESC, s.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (enterprise_id, SYSTEM_TARGET_URL, limit, offset),
             )
         elif user_id:
             cursor = await connection.execute(
@@ -1899,9 +2031,23 @@ async def list_scans(user_id: str | None = None, enterprise_id: str | None = Non
                 WHERE s.user_id = ? AND s.target_url != ?
                 GROUP BY s.id
                 ORDER BY s.created_at DESC, s.id DESC
-                LIMIT 100
                 """,
                 (user_id, SYSTEM_TARGET_URL),
+            )
+            total_rows = await cursor.fetchone()
+            total = total_rows[0] if total_rows else 0
+
+            cursor = await connection.execute(
+                f"""
+                SELECT {count_columns}
+                FROM scans s
+                LEFT JOIN findings f ON f.scan_id = s.id
+                WHERE s.user_id = ? AND s.target_url != ?
+                GROUP BY s.id
+                ORDER BY s.created_at DESC, s.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (user_id, SYSTEM_TARGET_URL, limit, offset),
             )
         else:
             cursor = await connection.execute(
@@ -1912,11 +2058,27 @@ async def list_scans(user_id: str | None = None, enterprise_id: str | None = Non
                 WHERE s.target_url != ?
                 GROUP BY s.id
                 ORDER BY s.created_at DESC, s.id DESC
-                LIMIT 100
                 """,
                 (SYSTEM_TARGET_URL,),
             )
-        return [dict(row) for row in await cursor.fetchall()]
+            total_rows = await cursor.fetchone()
+            total = total_rows[0] if total_rows else 0
+
+            cursor = await connection.execute(
+                f"""
+                SELECT {count_columns}
+                FROM scans s
+                LEFT JOIN findings f ON f.scan_id = s.id
+                WHERE s.target_url != ?
+                GROUP BY s.id
+                ORDER BY s.created_at DESC, s.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (SYSTEM_TARGET_URL, limit, offset),
+            )
+
+        rows = [dict(row) for row in await cursor.fetchall()]
+    return rows, total
 
 
 async def get_latest_scan(user_id: str | None = None) -> dict[str, Any] | None:
@@ -1990,7 +2152,7 @@ async def update_scan_status(scan_id: int, status: str, error_message: str | Non
     started_sql = ", started_at = COALESCE(started_at, CURRENT_TIMESTAMP)" if status == "running" else ""
     terminal_sql = ", completed_at = CURRENT_TIMESTAMP" if status in {"cancelled", "complete", "error"} else ""
     complete_sql = ", progress = 100" if status == "complete" else ""
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             f"UPDATE scans SET status = ?, error_message = ?{started_sql}{terminal_sql}{complete_sql} WHERE id = ?",
             (status, error_message, scan_id),
@@ -2001,26 +2163,28 @@ async def update_scan_status(scan_id: int, status: str, error_message: str | Non
 async def update_scan_progress(
     scan_id: int,
     progress: int,
-    request_count: int | None = None,
+    *,
+    request_count: Any | None = None,
     sandbox_id: str | None = None,
 ) -> None:
     assignments = ["progress = ?"]
     values: list[Any] = [max(0, min(progress, 100))]
-    if request_count is not None:
+    normalized_request_count = safe_int(request_count)
+    if normalized_request_count is not None:
         assignments.append("request_count = ?")
-        values.append(request_count)
+        values.append(normalized_request_count)
     if sandbox_id is not None:
         assignments.append("sandbox_id = ?")
         values.append(sandbox_id)
     values.append(scan_id)
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(f"UPDATE scans SET {', '.join(assignments)} WHERE id = ?", values)
         await connection.commit()
 
 
 async def create_finding(scan_id: int, finding: FindingCreate | dict[str, Any]) -> int:
     data = finding.model_dump(mode="json") if isinstance(finding, FindingCreate) else FindingCreate(**finding).model_dump(mode="json")
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO findings (
@@ -2029,8 +2193,11 @@ async def create_finding(scan_id: int, finding: FindingCreate | dict[str, Any]) 
                 how_exploited, fix, cve_id, cvss_score, cwe, version_affected,
                 file_path, line_number, code_snippet, fix_recommendation,
                 parameter, module, recommended_fix,
-                remediation_status, verification_status, risk_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                remediation_status, verification_status, risk_status,
+                request_id, confidence_score, confidence_label, reproduction_command,
+                request_response_diff, verification_hash, verification_method,
+                verification_stage, verification_result, source_correlation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 scan_id,
@@ -2063,6 +2230,16 @@ async def create_finding(scan_id: int, finding: FindingCreate | dict[str, Any]) 
                 data.get("remediation_status", "OPEN"),
                 data.get("verification_status", "NOT_VERIFIED"),
                 data.get("risk_status", "ACTIVE"),
+                data.get("request_id"),
+                data.get("confidence_score"),
+                data.get("confidence_label"),
+                data.get("reproduction_command"),
+                data.get("request_response_diff"),
+                data.get("verification_hash"),
+                data.get("verification_method"),
+                data.get("verification_stage"),
+                json.dumps(data.get("verification_result"), default=str) if data.get("verification_result") is not None else None,
+                json.dumps(data.get("source_correlation"), default=str) if data.get("source_correlation") is not None else None,
             ),
         )
         await connection.commit()
@@ -2092,7 +2269,53 @@ async def get_findings(scan_id: int, limit: int = 1000) -> list[dict[str, Any]]:
                     row[col] = json.loads(raw)
                 except json.JSONDecodeError:
                     row[col] = None
+        for json_col in ("verification_result", "source_correlation"):
+            raw = row.get(json_col)
+            if isinstance(raw, str):
+                try:
+                    row[json_col] = json.loads(raw)
+                except json.JSONDecodeError:
+                    row[json_col] = None
     return rows
+
+
+def deduplicate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group repeated finding rows while preserving the strongest evidence."""
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for finding in findings:
+        url = str(finding.get("endpoint") or finding.get("url") or finding.get("target") or "")
+        parsed = urlparse(url if "://" in url else f"//{url}")
+        host = (parsed.netloc or parsed.path).lower()
+        finding_type = str(finding.get("type") or finding.get("category") or finding.get("module") or finding.get("title") or "unknown").lower()
+        evidence_key = str(
+            finding.get("evidence_key")
+            or finding.get("verification_hash")
+            or finding.get("title")
+            or finding.get("evidence")
+            or ""
+        )[:200]
+        key = (finding_type, host, evidence_key)
+        existing = groups.get(key)
+        candidate = dict(finding)
+        if existing is None or _finding_strength(candidate) > _finding_strength(existing):
+            affected_urls = existing.get("affected_urls", []) if existing else []
+            candidate["affected_urls"] = affected_urls
+            groups[key] = candidate
+            existing = candidate
+        affected_urls = existing.setdefault("affected_urls", [])
+        if url and url not in affected_urls:
+            affected_urls.append(url)
+    return list(groups.values())
+
+
+def _finding_strength(finding: dict[str, Any]) -> tuple[int, float]:
+    severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+    severity = severity_rank.get(str(finding.get("severity") or "INFO").upper(), 0)
+    try:
+        confidence = float(finding.get("confidence_score") or 0)
+    except (TypeError, ValueError):
+        confidence = {"HIGH": 0.9, "MEDIUM": 0.6, "LOW": 0.3}.get(str(finding.get("confidence") or "LOW").upper(), 0.1)
+    return severity, confidence
 
 
 async def get_finding(finding_id: int) -> dict[str, Any] | None:
@@ -2116,6 +2339,17 @@ async def get_finding(finding_id: int) -> dict[str, Any] | None:
             result["correlation"] = json.loads(raw)
         except json.JSONDecodeError:
             result["correlation"] = None
+    for json_col in ("verification_result", "source_correlation"):
+        raw = result.get(json_col)
+        if isinstance(raw, str):
+            try:
+                result[json_col] = json.loads(raw)
+            except json.JSONDecodeError:
+                result[json_col] = None
+    try:
+        result["confidence_score"] = float(result["confidence_score"]) if result.get("confidence_score") is not None else None
+    except (TypeError, ValueError):
+        result["confidence_score"] = None
     return result
 
 
@@ -2137,6 +2371,16 @@ async def update_finding(finding_id: int, **fields: Any) -> None:
         "parameter",
         "module",
         "recommended_fix",
+        "request_id",
+        "confidence_score",
+        "confidence_label",
+        "reproduction_command",
+        "request_response_diff",
+        "verification_hash",
+        "verification_method",
+        "verification_stage",
+        "verification_result",
+        "source_correlation",
         "remediation_status",
         "verification_status",
         "risk_status",
@@ -2145,9 +2389,9 @@ async def update_finding(finding_id: int, **fields: Any) -> None:
     if not updates:
         return
     assignments = ", ".join(f"{name} = ?" for name, _ in updates)
-    values = [value for _, value in updates]
+    values = [json.dumps(value, default=str) if name in {"verification_result", "source_correlation"} and value is not None else value for name, value in updates]
     values.append(finding_id)
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(f"UPDATE findings SET {assignments} WHERE id = ?", values)
         await connection.commit()
 
@@ -2168,7 +2412,10 @@ async def list_findings(
         f.id, f.scan_id, f.title, f.category, f.severity, f.confidence,
         f.target, f.endpoint, f.agent, f.timestamp, f.cve_id, f.cvss_score,
         f.cwe, f.version_affected, f.file_path, f.line_number, f.parameter,
-        f.module, f.remediation_status, f.verification_status, f.risk_status
+        f.module, f.remediation_status, f.verification_status, f.risk_status,
+        f.request_id, f.confidence_score, f.confidence_label, f.reproduction_command,
+        f.request_response_diff, f.verification_hash, f.verification_method,
+        f.verification_stage, f.source_correlation
     """
     columns = "f.*" if include_details else summary_columns
     joins: list[str] = []
@@ -2208,7 +2455,7 @@ async def list_findings(
 
     async with get_connection() as connection:
         cursor = await connection.execute(
-            f"SELECT {columns} FROM findings f {' '.join(dict.fromkeys(joins))}{where} ORDER BY f.id ASC{pagination}",
+            f"SELECT {columns} FROM findings f {' '.join(dict.fromkeys(joins))}{where} ORDER BY f.scan_id DESC, f.id DESC{pagination}",
             values,
         )
         rows = [dict(row) for row in await cursor.fetchall()]
@@ -2227,6 +2474,19 @@ async def list_findings(
                 row["correlation"] = json.loads(raw)
             except json.JSONDecodeError:
                 row["correlation"] = None
+        for json_col in ("verification_result", "source_correlation"):
+            raw = row.get(json_col)
+            if isinstance(raw, str):
+                try:
+                    row[json_col] = json.loads(raw)
+                except json.JSONDecodeError:
+                    row[json_col] = None
+        raw_score = row.get("confidence_score")
+        if isinstance(raw_score, str):
+            try:
+                row["confidence_score"] = float(raw_score)
+            except ValueError:
+                row["confidence_score"] = None
     return rows
 
 
@@ -2341,11 +2601,12 @@ async def add_audit_log(
     start_time: str | None = None,
     end_time: str | None = None,
     result: str | None = None,
-    request_count: int | None = None,
+    request_count: Any | None = None,
     sandbox_id: str | None = None,
 ) -> int:
     safe_details = redact_sensitive(details[:2000])
-    async with get_connection() as connection:
+    normalized_request_count = safe_int(request_count)
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO audit_logs (
@@ -2365,12 +2626,62 @@ async def add_audit_log(
                 start_time,
                 end_time,
                 result,
-                request_count,
+                normalized_request_count,
                 sandbox_id,
             ),
         )
         await connection.commit()
         return int(cursor.lastrowid)
+
+
+async def add_candidate_rejection(
+    scan_id: int,
+    module: str,
+    endpoint: str,
+    reason: str,
+    *,
+    parameter: str | None = None,
+    evidence: str = "",
+) -> int:
+    async with get_write_connection() as connection:
+        cursor = await connection.execute(
+            """
+            INSERT INTO candidate_rejections (scan_id, module, endpoint, parameter, reason, evidence)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (scan_id, module, endpoint, parameter, reason, redact_sensitive(evidence[:2000])),
+        )
+        await connection.commit()
+        return int(cursor.lastrowid)
+
+
+async def list_candidate_rejections(scan_id: int | None = None, limit: int = 500) -> list[dict[str, Any]]:
+    async with get_connection() as connection:
+        if scan_id is not None:
+            cursor = await connection.execute(
+                """
+                SELECT r.*, s.target_url
+                FROM candidate_rejections r
+                JOIN scans s ON s.id = r.scan_id
+                WHERE r.scan_id = ? AND s.target_url != ?
+                ORDER BY r.id DESC
+                LIMIT ?
+                """,
+                (scan_id, SYSTEM_TARGET_URL, limit),
+            )
+        else:
+            cursor = await connection.execute(
+                """
+                SELECT r.*, s.target_url
+                FROM candidate_rejections r
+                JOIN scans s ON s.id = r.scan_id
+                WHERE s.target_url != ?
+                ORDER BY r.id DESC
+                LIMIT ?
+                """,
+                (SYSTEM_TARGET_URL, limit),
+            )
+        return [dict(row) for row in await cursor.fetchall()]
 
 
 async def get_audit_logs(scan_id: int) -> list[dict[str, Any]]:
@@ -2384,7 +2695,7 @@ async def get_audit_logs(scan_id: int) -> list[dict[str, Any]]:
 
 async def start_agent_run(scan_id: int, agent_name: str) -> int:
     now = datetime.now(timezone.utc).isoformat()
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO agent_runs (scan_id, agent_name, start_time, status)
@@ -2405,7 +2716,7 @@ async def complete_agent_run(
     attempts: int = 1,
 ) -> None:
     end_time = datetime.now(timezone.utc).isoformat()
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             """
             UPDATE agent_runs
@@ -2418,7 +2729,7 @@ async def complete_agent_run(
 
 
 async def upsert_learning_insights(scan_id: int, rows: list[dict[str, Any]]) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         for row in rows:
             await connection.execute(
                 """
@@ -2513,7 +2824,7 @@ async def update_learning_insight_status(
     status: str,
     applied_settings: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             """
             UPDATE learning_insights
@@ -2664,6 +2975,11 @@ async def set_scan_artifacts(
     exploitation_output: Any = _UNSET,
     tci_output: Any = _UNSET,
     ai_consultation: Any = _UNSET,
+    vuln_findings: Any = _UNSET,
+    verified_findings: Any = _UNSET,
+    attack_graph: Any = _UNSET,
+    attack_paths: Any = _UNSET,
+    path_validations: Any = _UNSET,
 ) -> None:
     values = {
         "scanner_output": scanner_output,
@@ -2676,6 +2992,11 @@ async def set_scan_artifacts(
         "exploitation_output": exploitation_output,
         "tci_output": tci_output,
         "ai_consultation": ai_consultation,
+        "vuln_findings": vuln_findings,
+        "verified_findings": verified_findings,
+        "attack_graph": attack_graph,
+        "attack_paths": attack_paths,
+        "path_validations": path_validations,
     }
     updates: list[str] = []
     parameters: list[Any] = []
@@ -2690,7 +3011,7 @@ async def set_scan_artifacts(
     if not updates:
         return
 
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute("INSERT OR IGNORE INTO scan_artifacts (scan_id) VALUES (?)", (scan_id,))
         parameters.append(scan_id)
         await connection.execute(
@@ -2703,7 +3024,22 @@ async def set_scan_artifacts(
 def deserialize_artifact_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
         return None
-    for column in ("scanner_output", "shadow_recon_output", "notification_result", "active_security_output", "browser_security_output", "ai_analyst_output", "exploitation_output", "tci_output", "ai_consultation"):
+    for column in (
+        "scanner_output",
+        "shadow_recon_output",
+        "notification_result",
+        "active_security_output",
+        "browser_security_output",
+        "ai_analyst_output",
+        "exploitation_output",
+        "tci_output",
+        "ai_consultation",
+        "vuln_findings",
+        "verified_findings",
+        "attack_graph",
+        "attack_paths",
+        "path_validations",
+    ):
         value = row.get(column)
         if value is not None:
             try:
@@ -2756,7 +3092,7 @@ async def set_ai_cache(
     response: Any,
 ) -> None:
     safe_response = json.dumps(redact_payload(response), ensure_ascii=True, default=str)
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             """
             INSERT INTO ai_cache (cache_key, finding_id, evidence_hash, language, model, response)
@@ -2792,7 +3128,7 @@ async def create_user(
     role: str = "user",
     subscription_tier: str = "FREE",
 ) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             """
             INSERT INTO users (id, email, password_hash, name, role, subscription_tier, subscription_status)
@@ -2850,7 +3186,7 @@ async def touch_last_login(user_id: str) -> None:
     """Record the current UTC time as the user's last login. Never raises."""
     try:
         from datetime import datetime, timezone
-        async with get_connection() as connection:
+        async with get_write_connection() as connection:
             await connection.execute(
                 "UPDATE users SET last_login = ? WHERE id = ?",
                 (datetime.now(timezone.utc).isoformat(), user_id),
@@ -2886,7 +3222,7 @@ async def get_user_by_email(email: str) -> dict[str, Any] | None:
 
 
 async def update_user_password(user_id: str, password_hash: str) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             "UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (password_hash, user_id),
@@ -2895,7 +3231,7 @@ async def update_user_password(user_id: str, password_hash: str) -> None:
 
 
 async def update_user_name(user_id: str, name: str) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             "UPDATE users SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (name, user_id),
@@ -2910,7 +3246,7 @@ async def update_user_subscription(
     stripe_customer_id: str | None = None,
     expires_at: str | None = None,
 ) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         fields = ["updated_at = CURRENT_TIMESTAMP"]
         values = []
         if tier is not None:
@@ -2941,7 +3277,7 @@ async def create_authorized_target(
     token_hash: str,
     challenge_expires_at: str,
 ) -> int:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO authorized_targets (
@@ -2981,7 +3317,7 @@ async def update_authorized_target(
     verified_at: str | None = None,
     expires_at: str | None = None,
 ) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             "UPDATE authorized_targets SET status = ?, verified_at = ?, expires_at = ? WHERE id = ?",
             (status, verified_at, expires_at, authorization_id),
@@ -2999,7 +3335,7 @@ async def create_authorized_test_job(
     user_id: str | None = None,
 ) -> str:
     job_id = uuid.uuid4().hex
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             """
             INSERT INTO authorized_test_jobs (
@@ -3071,7 +3407,7 @@ async def update_authorized_test_job(job_id: str, **fields: Any) -> None:
     assignments = ", ".join(f"{name} = ?" for name, _ in updates)
     values = [value for _, value in updates]
     values.append(job_id)
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             f"UPDATE authorized_test_jobs SET {assignments} WHERE id = ?", values
         )
@@ -3087,7 +3423,7 @@ async def add_job_event(
     status: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> int:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM job_events WHERE job_id = ?",
             (job_id,),
@@ -3146,7 +3482,7 @@ async def upsert_execution_status(
     completed_sql = ", completed_at = ?" if terminal else ""
     progress_sql = ", progress_percent = 100" if lifecycle == "COMPLETED" else ""
     agent_json = json.dumps(agent_states or [], ensure_ascii=True, default=str)
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         existing = await connection.execute("SELECT id FROM execution_status ORDER BY id DESC LIMIT 1")
         row = await existing.fetchone()
         if row is not None:
@@ -3196,13 +3532,13 @@ async def upsert_execution_status(
 
 
 async def clear_execution_status() -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute("DELETE FROM execution_status")
         await connection.commit()
 
 
 async def create_evidence_record(evidence: dict[str, Any]) -> int:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO evidence_records (
@@ -3235,7 +3571,7 @@ async def create_evidence_record(evidence: dict[str, Any]) -> int:
 
 
 async def update_evidence_finding(evidence_id: int, finding_id: int) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             "UPDATE evidence_records SET finding_id = ? WHERE id = ?",
             (finding_id, evidence_id),
@@ -3262,7 +3598,7 @@ async def get_evidence_for_finding(finding_id: int) -> list[dict[str, Any]]:
 
 
 async def add_private_scope(target_url: str, added_by: str = "admin") -> int:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO private_scope (target_url, added_by)
@@ -3296,7 +3632,7 @@ async def find_private_scope(target_url: str) -> dict[str, Any] | None:
 
 
 async def update_private_scope_last_used(target_url: str) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             "UPDATE private_scope SET last_used = datetime('now') WHERE target_url = ?",
             (target_url,),
@@ -3305,7 +3641,7 @@ async def update_private_scope_last_used(target_url: str) -> None:
 
 
 async def remove_private_scope(target_url: str) -> bool:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             "DELETE FROM private_scope WHERE target_url = ?",
             (target_url,),
@@ -3326,7 +3662,7 @@ async def create_brutal_op(
     payload: str | None = None,
     output: str | None = None,
 ) -> int:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO brutal_ops (
@@ -3370,7 +3706,7 @@ async def update_brutal_op(
     if not sets:
         return
     values.append(op_id)
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             f"UPDATE brutal_ops SET {', '.join(sets)} WHERE id = ?", values
         )
@@ -3404,7 +3740,7 @@ async def create_brutal_session_row(
     timeline: list[dict] | None = None,
     loot: list[dict] | None = None,
 ) -> None:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             """
             INSERT INTO brutal_sessions (
@@ -3456,7 +3792,7 @@ async def save_brutal_session_row(
     cols = ["session_id"] + [c for c, v in fields.items() if v is not None]
     values = [session_id] + [v for v in fields.values() if v is not None]
     conflict = ", ".join(f"{c} = excluded.{c}" for c in cols if c != "session_id")
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             f"""
             INSERT INTO brutal_sessions ({', '.join(cols)})
@@ -3513,7 +3849,7 @@ async def save_exploitation_result(
     status: str = "completed",
     error_message: str | None = None,
 ) -> int:
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             """
             INSERT INTO exploitation_results (
@@ -3630,7 +3966,7 @@ async def upsert_scan_source(
     artifacts: dict[str, Any] | None = None,
 ) -> int:
     """Insert or update a scan_sources row for a scan."""
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         cursor = await connection.execute(
             "SELECT id FROM scan_sources WHERE scan_id = ? AND source_type = ?",
             (scan_id, source_type),
@@ -3719,7 +4055,7 @@ async def update_scan_source_status(
         sets.append("completed_at = CURRENT_TIMESTAMP")
     sets.append("started_at = COALESCE(started_at, CURRENT_TIMESTAMP)")
     params.extend([scan_id, source_type])
-    async with get_connection() as connection:
+    async with get_write_connection() as connection:
         await connection.execute(
             f"UPDATE scan_sources SET {', '.join(sets)} WHERE scan_id = ? AND source_type = ?",
             params,

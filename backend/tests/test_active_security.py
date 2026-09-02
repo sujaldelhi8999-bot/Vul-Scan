@@ -1,11 +1,7 @@
 import os
-import tempfile
 from datetime import datetime, timezone
 from unittest import IsolatedAsyncioTestCase, TestCase
 
-_db_fd, _db_path = tempfile.mkstemp(suffix=".sqlite3")
-os.close(_db_fd)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 os.environ.setdefault("MAX_TOTAL_REQUESTS", "50")
 os.environ.setdefault("MAX_REQUESTS_PER_SECOND", "100")
 
@@ -288,7 +284,7 @@ class FindingVerificationApiTests(TestCase):
 
         scan_id = asyncio.run(setup())
         with TestClient(app, base_url="http://localhost") as client:
-            headers = create_auth_headers(client)
+            headers = asyncio.run(create_admin_headers(client))
             with client.websocket_connect(f"/ws/scan/{scan_id}", headers=headers) as websocket:
                 message = websocket.receive_json()
         self.assertEqual(message["event"], "snapshot")
@@ -531,7 +527,7 @@ class AuthorizedTestJobTests(IsolatedAsyncioTestCase):
         )
         await update_authorized_test_job(job_id, status="RUNNING", progress_percent=42, current_module="xss", current_phase="Testing")
         with TestClient(app, base_url="http://localhost") as client:
-            headers = create_auth_headers(client)
+            headers = await create_admin_headers(client)
             response = client.get(f"/api/active/jobs/{job_id}", headers=headers)
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -574,7 +570,7 @@ class AuthorizedTestJobTests(IsolatedAsyncioTestCase):
         })
         await update_authorized_test_job(job_id, status="COMPLETED", progress_percent=100, findings_count=1)
         with TestClient(app, base_url="http://localhost") as client:
-            headers = create_auth_headers(client)
+            headers = await create_admin_headers(client)
             response = client.get(f"/api/active/jobs/{job_id}/results", headers=headers)
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -594,7 +590,7 @@ class AuthorizedTestJobTests(IsolatedAsyncioTestCase):
         )
         await update_authorized_test_job(job_id, status="RUNNING")
         with TestClient(app, base_url="http://localhost") as client:
-            headers = create_auth_headers(client)
+            headers = await create_admin_headers(client)
             response = client.get(f"/api/active/jobs/{job_id}/results", headers=headers)
         self.assertEqual(response.status_code, 425)
 
@@ -815,7 +811,7 @@ class AuthorizedTestJobTests(IsolatedAsyncioTestCase):
         await add_job_event(job_id, "JOB_STARTED", "Started", status="RUNNING")
         await add_job_event(job_id, "JOB_COMPLETED", "Done", status="COMPLETED")
         with TestClient(app, base_url="http://localhost") as client:
-            headers = create_auth_headers(client)
+            headers = await create_admin_headers(client)
             response = client.get(f"/api/active/jobs/{job_id}/events?after_sequence=0", headers=headers)
         self.assertEqual(response.status_code, 200)
         data = response.json()
@@ -853,7 +849,7 @@ class AuthorizedTestJobTests(IsolatedAsyncioTestCase):
         self.assertEqual(job["testable_surfaces"], 8)
         self.assertEqual(job["surface_groups"], 2)
         with TestClient(app, base_url="http://localhost") as client:
-            headers = create_auth_headers(client)
+            headers = await create_admin_headers(client)
             response = client.get(f"/api/active/jobs/{job_id}", headers=headers)
         data = response.json()
         self.assertEqual(data["raw_surfaces_discovered"], 21)

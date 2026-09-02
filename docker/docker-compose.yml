@@ -1,5 +1,64 @@
 services:
+  backend:
+    build: ../backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////app/data/phantomscan.db
+      FRONTEND_URL: http://localhost:5173
+      SECRET_KEY: ${SECRET_KEY:-change-me-dev-only-generate-a-real-secret}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openrouter/free}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      NVD_API_KEY: ${NVD_API_KEY:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITHUB_REDIRECT_URI: ${GITHUB_REDIRECT_URI:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
+      SUPABASE_ADMIN_EMAILS: ${SUPABASE_ADMIN_EMAILS:-}
+      ACTIVE_TARGET_ALLOWLIST: ${ACTIVE_TARGET_ALLOWLIST:-}
+      MAX_SCAN_DURATION: ${MAX_SCAN_DURATION:-300}
+      MAX_REQUESTS_PER_SECOND: ${MAX_REQUESTS_PER_SECOND:-2}
+      MAX_TOTAL_REQUESTS: ${MAX_TOTAL_REQUESTS:-300}
+      MAX_CONCURRENT_SCANS: ${MAX_CONCURRENT_SCANS:-2}
+      MAX_REDIRECT_DEPTH: ${MAX_REDIRECT_DEPTH:-0}
+      MAX_RESPONSE_SIZE: ${MAX_RESPONSE_SIZE:-1048576}
+      BROWSER_PAGE_LIMIT: ${BROWSER_PAGE_LIMIT:-8}
+      EXPLOITATION_ENABLED: ${EXPLOITATION_ENABLED:-false}
+      AI_EXPLOITATION_ENABLED: ${AI_EXPLOITATION_ENABLED:-false}
+      BRUTAL_MODE_ENABLED: ${BRUTAL_MODE_ENABLED:-false}
+      PHANTOMSCAN_WEBHOOK_URL: ${PHANTOMSCAN_WEBHOOK_URL:-}
+      SELF_AUDIT_WEBHOOK: ${SELF_AUDIT_WEBHOOK:-http://localhost:8000/api/logs/alert}
+    volumes:
+      - ../backend:/app
+      - phantomscan_sqlite:/app/data
+    command: uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+  frontend:
+    build: ../frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+      VITE_WS_BASE_URL: ws://localhost:8000
+      VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+      VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-}
+    command: npm run dev -- --host 0.0.0.0
+
   postgres:
+    profiles: ["postgres"]
     image: timescale/timescaledb:latest-pg16
     ports:
       - "5432:5432"
@@ -17,6 +76,7 @@ services:
       retries: 5
 
   redis:
+    profiles: ["redis"]
     image: redis:7-alpine
     ports:
       - "6379:6379"
@@ -28,35 +88,7 @@ services:
       timeout: 3s
       retries: 5
 
-  backend:
-    build: ../backend
-    ports:
-      - "8000:8000"
-    env_file:
-      - ../backend/.env
-    volumes:
-      - ../backend:/app
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    command: uvicorn main:app --reload --host 0.0.0.0 --port 8000
-
-  frontend:
-    build: ../frontend
-    depends_on:
-      - backend
-    ports:
-      - "5173:5173"
-    volumes:
-      - ../frontend:/app
-      - /app/node_modules
-    environment:
-      VITE_API_BASE_URL: http://backend:8000
-      VITE_WS_BASE_URL: ws://backend:8000
-    command: npm run dev -- --host
-
 volumes:
+  phantomscan_sqlite:
   postgres_data:
   redis_data:

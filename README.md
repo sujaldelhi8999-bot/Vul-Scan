@@ -13,14 +13,15 @@ Built for **authorized security testing** on targets you own, the PhantomBank La
 ```bash
 git clone <repo-url>
 cd phantomscan
-cp backend/.env.example backend/.env
-# Edit backend/.env with your API keys (see Configuration below)
+cp .env.example .env
+# Set SECRET_KEY and optional API keys (see Configuration below)
 docker-compose -f docker/docker-compose.yml up --build
 ```
 
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000
 - **Swagger UI**: http://localhost:8000/docs
+- **Database**: SQLite persisted in the Docker volume `phantomscan_sqlite`
 
 ### Option 2: Local Development
 
@@ -41,7 +42,7 @@ npm run dev
 
 > **Port note**: The backend runs on port `8000` (matching Docker). If port
 > `8000` is occupied, start the backend on `8001` and set
-> `VITE_API_BASE_URL=http://127.0.0.1:8001` in `frontend/.env` so the frontend
+> `VITE_API_BASE_URL=http://localhost:8001` in `frontend/.env` so the frontend
 > connects to it.
 
 ---
@@ -163,15 +164,15 @@ phantomscan/
 | `BRUTAL_EXFIL_PASSWORD` | _none_ | Loot archive password; when empty the key is derived from `SECRET_KEY` + `session_id` |
 | `BRUTAL_EVASION_OBFUSCATE` | `0` | Payload obfuscation for exploit/shell traffic. **Off by default** (canned lab keyword-matching relies on it). |
 | `BRUTAL_EVASION_SLOW_SCAN` | `0` | Randomized request jitter/slow-scan cadence. **Off by default.** |
-| **Redis & PostgreSQL pool** | | |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
+| **Optional / future services** | | |
+| `REDIS_URL` | `redis://localhost:6379/0` | Optional Redis connection URL; not required by the current default Docker stack |
 | `REDIS_MAX_CONNECTIONS` | `50` | Max Redis pool connections |
 | `REDIS_SOCKET_TIMEOUT` | `5.0` | Redis socket timeout (s) |
 | `REDIS_SOCKET_CONNECT_TIMEOUT` | `5.0` | Redis connect timeout (s) |
-| `PG_POOL_MIN_SIZE` | `5` | Asyncpg pool min connections |
-| `PG_POOL_MAX_SIZE` | `20` | Asyncpg pool max connections |
-| `PG_POOL_TIMEOUT` | `30.0` | Pool acquire timeout (s) |
-| `PG_COMMAND_TIMEOUT` | `60.0` | Per-command timeout (s) |
+| `PG_POOL_MIN_SIZE` | `5` | Future PostgreSQL migration setting; inactive in the current SQLite runtime |
+| `PG_POOL_MAX_SIZE` | `20` | Future PostgreSQL migration setting; inactive in the current SQLite runtime |
+| `PG_POOL_TIMEOUT` | `30.0` | Future PostgreSQL migration setting; inactive in the current SQLite runtime |
+| `PG_COMMAND_TIMEOUT` | `60.0` | Future PostgreSQL migration setting; inactive in the current SQLite runtime |
 | **Rate limiting** | | |
 | `RATE_LIMIT_ENABLED` | `1` | Toggles API rate limiting |
 | `RATE_LIMIT_REQUESTS` | `100` | Requests allowed per window |
@@ -192,11 +193,23 @@ phantomscan/
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `VITE_API_BASE_URL` | `http://127.0.0.1:8000` | Backend API base URL |
-| `VITE_WS_BASE_URL` | `ws://127.0.0.1:8000` | WebSocket base URL |
+| `VITE_API_BASE_URL` | `http://localhost:8000` | Browser-facing backend API base URL |
+| `VITE_WS_BASE_URL` | `ws://localhost:8000` | Browser-facing WebSocket base URL |
 | `VITE_API_URL` | _none_ | Legacy variable (unused, kept for compatibility) |
 | `VITE_SUPABASE_URL` | _none_ | Supabase project URL (Google / GitHub login) |
 | `VITE_SUPABASE_ANON_KEY` | _none_ | Supabase anon public key (Project Settings → API) |
+
+---
+
+### Active Database Runtime
+
+The current application runtime uses `backend/app/database.py`, an `aiosqlite`
+storage layer with in-place schema migrations. The supported active
+`DATABASE_URL` format is `sqlite:///...`.
+
+The SQLAlchemy files under `backend/app/database_orm/` and Alembic configuration
+are retained as future PostgreSQL migration infrastructure, but they are not the
+active runtime persistence path yet.
 
 ---
 
@@ -738,6 +751,10 @@ cp .env.example .env
 python -m pytest tests/ -v
 ```
 
+Backend tests force an isolated SQLite database through `backend/tests/conftest.py`
+and clean up the test database, WAL, and SHM files after the run. Test runs do
+not use or modify your local `phantomscan.db`.
+
 ---
 
 ## 🐳 Docker
@@ -747,6 +764,18 @@ python -m pytest tests/ -v
 docker-compose -f docker/docker-compose.yml up --build
 ```
 
+The default Compose stack starts only the backend and frontend. Runtime storage
+uses SQLite at `/app/data/phantomscan.db` inside the backend container, persisted
+by the named Docker volume `phantomscan_sqlite`.
+
+PostgreSQL/TimescaleDB and Redis services are available only as optional future
+development profiles and are not required for the current application runtime:
+
+```bash
+docker compose -f docker/docker-compose.yml --profile postgres up postgres
+docker compose -f docker/docker-compose.yml --profile redis up redis
+```
+
 ### Environment Configuration in Docker
 The docker-compose file sets the frontend environment variables:
 - `VITE_API_BASE_URL: http://localhost:8000`
@@ -754,8 +783,8 @@ The docker-compose file sets the frontend environment variables:
 
 For local development (without Docker), create a `frontend/.env` file:
 ```dotenv
-VITE_API_BASE_URL=http://127.0.0.1:8000
-VITE_WS_BASE_URL=ws://127.0.0.1:8000
+VITE_API_BASE_URL=http://localhost:8000
+VITE_WS_BASE_URL=ws://localhost:8000
 ```
 
 ---

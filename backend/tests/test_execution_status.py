@@ -1,12 +1,6 @@
 import json
-import os
-import tempfile
 from datetime import datetime, timezone
 from unittest import IsolatedAsyncioTestCase
-
-_db_fd, _db_path = tempfile.mkstemp(suffix=".exec.sqlite3")
-os.close(_db_fd)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 
 from fastapi.testclient import TestClient
 

@@ -579,7 +579,8 @@ class IntelligenceService:
                 )
                 findings = [dict(row) for row in await cursor.fetchall()]
 
-        for finding in findings:
+        deduped = self._dedupe_real_findings(findings)
+        for finding in deduped:
             severity = (finding.get("severity") or "INFO").upper()
             normalized = {
                 "id": finding.get("id"),
@@ -597,10 +598,108 @@ class IntelligenceService:
                 "cve_id": finding.get("cve_id"),
                 "cvss_score": finding.get("cvss_score"),
                 "recommended_fix": finding.get("recommended_fix"),
+                "confidence_score": finding.get("confidence_score"),
+                "confidence_label": finding.get("confidence_label"),
+                "risk_status": finding.get("risk_status"),
+                "reproduction_command": finding.get("reproduction_command"),
+                "request_response_diff": finding.get("request_response_diff"),
+                "verification_result": self._json_value(finding.get("verification_result")),
             }
+            verification = normalized.get("verification_result") if isinstance(normalized.get("verification_result"), dict) else {}
+            if verification.get("affected_urls"):
+                normalized["affected_urls"] = verification.get("affected_urls")
+            elif finding.get("_affected_urls"):
+                normalized["affected_urls"] = finding.get("_affected_urls")
             severity_lower = severity.lower()
             if severity_lower in data["findings"]:
                 data["findings"][severity_lower].append(normalized)
+        for severity in data["findings"]:
+            data["findings"][severity].sort(key=self._finding_priority, reverse=True)
+
+    @staticmethod
+    def _json_value(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return None
+        return value
+
+    def _dedupe_real_findings(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        by_signature: Dict[str, Dict[str, Any]] = {}
+        for finding in findings:
+            if self._is_false_positive_or_non_issue(finding):
+                continue
+            signature = self._evidence_signature(finding)
+            current = by_signature.get(signature)
+            if current is None or self._finding_priority(finding) > self._finding_priority(current):
+                merged = dict(finding)
+                merged["_affected_urls"] = self._affected_urls(current, finding) if current else self._affected_urls(None, finding)
+                by_signature[signature] = merged
+            elif current is not None:
+                current["_affected_urls"] = self._affected_urls(current, finding)
+        return list(by_signature.values())
+
+    def _is_false_positive_or_non_issue(self, finding: Dict[str, Any]) -> bool:
+        if str(finding.get("risk_status") or "ACTIVE").upper() == "FALSE_POSITIVE":
+            return True
+        if str(finding.get("remediation_status") or "").upper() == "RESOLVED":
+            return True
+        if str(finding.get("verification_status") or "").upper() == "FIX_VERIFIED":
+            return True
+        text = " ".join(str(finding.get(name) or "") for name in ("title", "category", "evidence", "request_response_diff", "verification_result")).lower()
+        verification = self._json_value(finding.get("verification_result"))
+        if "hsts" in text or "strict-transport-security" in text:
+            if re.search(r"hsts (enabled|present|valid)|strict-transport-security: max-age=[1-9]", text):
+                return True
+        if "tls" in text or "https" in text:
+            tls = verification.get("tls") if isinstance(verification, dict) and isinstance(verification.get("tls"), dict) else {}
+            if (tls.get("supports_tls12") or tls.get("supports_tls13")) and tls.get("certificate_ok", True):
+                return True
+            if re.search(r"tls (1\.2|1\.3).*(works|ok|succeeded|supported)", text):
+                return True
+        return False
+
+    def _evidence_signature(self, finding: Dict[str, Any]) -> str:
+        endpoint = str(finding.get("endpoint") or finding.get("target") or self.target_url)
+        host = urlparse(endpoint if endpoint.startswith(("http://", "https://")) else self.target_url).netloc.lower()
+        verification = self._json_value(finding.get("verification_result"))
+        if isinstance(verification, dict) and verification.get("evidence_signature"):
+            evidence = str(verification["evidence_signature"])
+        else:
+            evidence = str(finding.get("parameter") or finding.get("cwe") or finding.get("title") or "").lower()
+        module = str(finding.get("module") or finding.get("category") or "").lower()
+        title = str(finding.get("title") or "").lower()
+        header = ""
+        header_match = re.search(r"(strict-transport-security|content-security-policy|x-frame-options|x-content-type-options|referrer-policy|frame-protection)", title + " " + evidence)
+        if header_match:
+            header = header_match.group(1)
+        return f"{module}|{host}|{header or title}|{evidence}"
+
+    def _affected_urls(self, current: Dict[str, Any] | None, finding: Dict[str, Any]) -> List[str]:
+        urls: List[str] = []
+        for source in (current, finding):
+            if not source:
+                continue
+            verification = self._json_value(source.get("verification_result"))
+            if isinstance(verification, dict) and isinstance(verification.get("affected_urls"), list):
+                urls.extend(str(item) for item in verification["affected_urls"] if item)
+            if source.get("_affected_urls"):
+                urls.extend(str(item) for item in source["_affected_urls"] if item)
+            if source.get("endpoint"):
+                urls.append(str(source["endpoint"]))
+        return sorted(set(urls))
+
+    @staticmethod
+    def _finding_priority(finding: Dict[str, Any]) -> tuple[int, float, int]:
+        severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+        confidence_rank = {"CONFIRMED": 1.0, "HIGH": 0.9, "MEDIUM": 0.6, "LOW": 0.3, "POTENTIAL": 0.2}
+        severity = severity_rank.get(str(finding.get("severity") or "INFO").upper(), 0)
+        try:
+            confidence = float(finding.get("confidence_score"))
+        except (TypeError, ValueError):
+            confidence = confidence_rank.get(str(finding.get("confidence_label") or finding.get("confidence") or "LOW").upper(), 0.1)
+        return (severity, confidence, int(finding.get("id") or 0))
 
     async def _populate_entry_points(self, data: Dict[str, Any]) -> None:
         seen_params: set = set()

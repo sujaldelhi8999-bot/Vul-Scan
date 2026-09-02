@@ -1130,14 +1130,15 @@ class ThreatIntelligenceAgent(_AssessmentAgent):
 
         robots = context.shadow_output.get("robots_txt")
         robots_body = str(robots.get("body", "")) if isinstance(robots, dict) else (robots if isinstance(robots, str) else "")
-        if isinstance(robots, dict) and _as_status(robots.get("status_code")) == 200 or (isinstance(robots, str) and robots.strip()):
+        robots_url = str(robots.get("url", context.target_url)) if isinstance(robots, dict) else (robots if isinstance(robots, str) else context.target_url)
+        if (isinstance(robots, dict) and _as_status(robots.get("status_code")) == 200) or (isinstance(robots, str) and robots.strip()):
             paths = re.findall(r"(?im)^\s*(?:allow|disallow)\s*:\s*(\S+)", robots_body)
             sensitive_paths = [path for path in paths if self._SENSITIVE_PATH.search(path)]
             if sensitive_paths:
                 evidence_paths = ", ".join(_safe_url(path) for path in sensitive_paths[:10])
                 findings.append(self.finding(
                     context, title="robots.txt discloses sensitive-looking paths", category="Threat Intelligence",
-                    severity="LOW", confidence="POTENTIAL", endpoint=str(robots.get("url", context.target_url)),
+                    severity="LOW", confidence="POTENTIAL", endpoint=robots_url,
                     evidence=f"Captured robots.txt names path(s): {evidence_paths}. Disallow does not enforce access control.",
                     impact="Published path names can help attackers discover administrative, backup, or internal surfaces.",
                     recommendation="Remove unnecessary sensitive path hints and enforce authentication regardless of crawler directives.",

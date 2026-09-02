@@ -3,7 +3,8 @@ import json
 import logging
 from typing import Any, get_args
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import ValidationError
 
 logger = logging.getLogger("phantomscan.scan")
 
@@ -23,6 +24,7 @@ from app.models import (
     PRDescriptionResponse,
     ScanArtifactsResponse,
     ScanHistoryItem,
+    ScanHistoryResponse,
     ScanRequest,
     ScanResponse,
     StopScanResponse,
@@ -42,6 +44,33 @@ settings = get_settings()
 authorization_service = TargetAuthorizationService()
 scan_policy = ScanPolicy(authorization_service)
 VALID_TEST_MODULES = set(get_args(TestModule))
+
+
+async def _parse_scan_request(request: Request) -> ScanRequest:
+    payload: dict[str, Any] = dict(request.query_params)
+    content_type = request.headers.get("content-type", "").lower()
+
+    try:
+        if "application/json" in content_type:
+            body = await request.json()
+            if isinstance(body, dict):
+                payload.update(body)
+        elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+            form = await request.form()
+            payload.update(dict(form))
+        else:
+            raw = await request.body()
+            if raw:
+                body = json.loads(raw)
+                if isinstance(body, dict):
+                    payload.update(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON scan request") from exc
+
+    try:
+        return ScanRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
 
 
 def _selected_tests(value: Any) -> list[str]:
@@ -94,9 +123,10 @@ async def _verify_scan_ownership(scan_id: int, user: dict[str, Any]) -> dict[str
 
 @router.post("/start", response_model=ScanResponse, status_code=status.HTTP_201_CREATED)
 async def start_scan(
-    scan_request: ScanRequest,
+    request: Request,
     user: dict = Depends(get_current_user),
 ) -> ScanResponse:
+    scan_request = await _parse_scan_request(request)
     logger.debug("[SCAN] REQUEST RECEIVED")
     logger.info("Scan request received for target=%s mode=%s user=%s", scan_request.target_url, scan_request.mode, user["id"])
 
@@ -115,7 +145,10 @@ async def start_scan(
     except ScanCapacityError as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
 
-    canonical_request = scan_request.model_copy(update={"target_url": admission.target_url})
+    scan_profile = scan_request.profile or scan_request.scan_depth
+    canonical_request = scan_request.model_copy(
+        update={"target_url": admission.target_url, "scan_depth": scan_profile, "profile": scan_profile}
+    )
     authorization_id = admission.verified_target.id if admission.verified_target is not None else None
     scan_id: int | None = None
     try:
@@ -135,7 +168,7 @@ async def start_scan(
             "scan_created",
             (
                 f"Created {canonical_request.mode} scan for {admission.target_url} with "
-                f"{canonical_request.intensity} intensity and modules: "
+                f"{canonical_request.intensity} intensity, {canonical_request.profile} profile and modules: "
                 f"{', '.join(canonical_request.selected_tests) or 'none'}"
             ),
             user_id=user["id"],
@@ -168,10 +201,14 @@ async def start_scan(
     return _scan_response(row, filter_findings_for_user(await get_findings(scan_id), user))
 
 
-@router.get("/history", response_model=list[ScanHistoryItem])
-async def scan_history(user: dict = Depends(get_current_user)) -> list[ScanHistoryItem]:
-    rows = await list_scans(user["id"], enterprise_id_for(user))
-    return [ScanHistoryItem(**row) for row in rows]
+@router.get("/history", response_model=ScanHistoryResponse)
+async def scan_history(
+    user: dict = Depends(get_current_user),
+    limit: int = 20,
+    offset: int = 0,
+) -> ScanHistoryResponse:
+    rows, total = await list_scans(user["id"], enterprise_id_for(user), limit, offset)
+    return {"scans": [ScanHistoryItem(**row) for row in rows], "total": total, "limit": limit, "offset": offset}
 
 
 @router.post("/{scan_id}/stop", response_model=StopScanResponse)
@@ -194,6 +231,23 @@ async def scan_artifacts(scan_id: int, user: dict = Depends(get_current_user)) -
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
     artifacts = await get_scan_artifacts(scan_id)
     return ScanArtifactsResponse(**{"scan_id": scan_id, **(artifacts or {})})
+
+
+@router.get("/artifacts/batch")
+async def batch_artifacts(
+    scan_ids: str = Query(...),
+    user: dict = Depends(get_current_user),
+) -> dict[int, dict]:
+    ids = [int(id_.strip()) for id_ in scan_ids.split(",") if id_.strip()]
+    results: dict[int, dict] = {}
+    for sid in ids[:100]:
+        try:
+            await _verify_scan_ownership(sid, user)
+            artifacts = await get_scan_artifacts(sid)
+            results[sid] = {"scan_id": sid, **(artifacts or {})}
+        except Exception:
+            pass
+    return results
 
 
 @router.get("/{scan_id}", response_model=ScanResponse)

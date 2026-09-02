@@ -23,6 +23,7 @@ RUN wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitle
     && rm /tmp/gitleaks.tar.gz
 
 WORKDIR /app
+RUN mkdir -p /app/data
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt

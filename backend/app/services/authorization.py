@@ -72,9 +72,22 @@ def hash_token(token: str) -> str:
 def canonicalize_target(target_url: str) -> CanonicalTarget:
     candidate = target_url.strip()
     if "://" not in candidate:
-        raw_host = candidate.split("/")[0].split(":")[0].lower()
+        raw_netloc = candidate.split("/", 1)[0].rsplit("@", 1)[-1].lower()
+        if raw_netloc.startswith("[") and "]" in raw_netloc:
+            raw_host = raw_netloc[1 : raw_netloc.index("]")]
+        elif raw_netloc.count(":") == 1:
+            raw_host = raw_netloc.rsplit(":", 1)[0]
+        else:
+            raw_host = raw_netloc
+        try:
+            ipaddress.ip_address(raw_host)
+            is_ip_literal = True
+        except ValueError:
+            is_ip_literal = False
         if raw_host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or raw_host.startswith(("192.168.", "10.", "172.")):
             candidate = f"http://{candidate}"
+        elif not is_ip_literal and "." not in raw_host:
+            raise TargetValidationError("Target must include a valid hostname")
         else:
             candidate = f"https://{candidate}"
     parsed = urlsplit(candidate)
@@ -91,6 +104,13 @@ def canonicalize_target(target_url: str) -> CanonicalTarget:
         domain = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
     except UnicodeError as exc:
         raise TargetValidationError("Target hostname is invalid") from exc
+    try:
+        ipaddress.ip_address(domain)
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    if not is_ip_literal and domain != "localhost" and "." not in domain:
+        raise TargetValidationError("Target must include a valid hostname")
 
     try:
         port = parsed.port

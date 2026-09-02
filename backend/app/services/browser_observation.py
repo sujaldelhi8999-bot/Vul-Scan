@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
@@ -12,9 +13,11 @@ from urllib.parse import parse_qsl, urljoin, urlsplit
 import httpx
 
 from app.security import build_finding, redact_sensitive, redact_url
+from app.services.asset_cache import asset_cache
 from app.services.authorization import canonicalize_target
 from app.services.execution import ExecutionBudget, ExecutionLimitError, SafetyLimits, ScanCancelled
 from app.services.redaction import SecretRedactionService, redaction_service
+from app.websockets import scan_event_broker
 
 logger = logging.getLogger("phantomscan.browser_observation")
 
@@ -539,7 +542,12 @@ class BrowserObservationEngine:
         result: dict[str, Any]
         try:
             self.budget.check()
-            if self.use_playwright and self.transport is None:
+            if self.use_playwright and self.transport is None and sys.platform == "win32":
+                session.security_events.append({"event": "browser_fallback", "reason": "Playwright disabled on Windows; using HTTP observer"})
+                result = await self.run_http_observation(session)
+                result["browser_engine"] = "http_fallback"
+                result["browser_fallback_reason"] = "Playwright disabled on Windows; using HTTP observer"
+            elif self.use_playwright and self.transport is None:
                 result = await self.run_playwright(session)
             else:
                 result = await self.run_http_observation(session)
@@ -630,7 +638,8 @@ class BrowserObservationEngine:
             except Exception:
                 pass
             script_sources = [script.get("src") for script in dom.get("scripts", []) if script.get("src") and self.safety.is_in_scope(str(script.get("src")))]
-            for script_url in script_sources[:10]:
+            for index, script_url in enumerate(script_sources[:10], start=1):
+                await self.publish_asset_progress(str(script_url), index, min(len(script_sources), 10))
                 asset = await self.fetch_text(str(script_url), session, "script")
                 if asset is None:
                     continue
@@ -715,16 +724,17 @@ class BrowserObservationEngine:
                         queue.append(link)
                 for websocket_url in dom.get("websocket_urls", []):
                     session.websocket_events.append({"url": redact_url(websocket_url), "connection_time": None, "authentication_state": "not_connected", "origin": self.target.origin, "message_schema": None})
-                for script in dom.get("scripts", [])[:20]:
+                scripts = dom.get("scripts", [])[:20]
+                for index, script in enumerate(scripts, start=1):
                     script_url = script.get("src")
                     if not script_url:
                         continue
                     if not self.safety.is_in_scope(str(script_url)):
                         continue
-                    script_response = await self.safe_request(client, "GET", str(script_url), session, "script")
-                    if script_response is None:
+                    await self.publish_asset_progress(str(script_url), index, len(scripts))
+                    source = await self.fetch_text(str(script_url), session, "script", client)
+                    if source is None:
                         continue
-                    source = str(script_response.get("body") or "")
                     analysis = self.js_analyzer.analyze(str(script_url), source)
                     javascript.append(analysis)
                     for websocket_url in analysis.get("websocket_urls", []):
@@ -780,10 +790,29 @@ class BrowserObservationEngine:
                 session.page_events.append({"event": "redirect_observed", "from": redact_url(url), "to": redact_url(destination), "status": response.status_code})
         return {"status": response.status_code, "headers": headers, "body": redact_sensitive(body, self.limits.max_response_size)}
 
-    async def fetch_text(self, url: str, session: BrowserSession, resource_type: str) -> str | None:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=False, trust_env=False, headers={"User-Agent": "PhantomScan-BrowserObservation/1.0"}) as client:
+    async def fetch_text(self, url: str, session: BrowserSession, resource_type: str, client: httpx.AsyncClient | None = None) -> str | None:
+        if self.cacheable_asset(resource_type, url):
+            cached = asset_cache.get(url)
+            if cached is not None:
+                session.security_events.append({"event": "asset_cache_hit", "url": redact_url(url), "resource_type": resource_type})
+                return cached
+
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=8.0, follow_redirects=False, trust_env=False, headers={"User-Agent": "PhantomScan-BrowserObservation/1.0"})
+            close_client = True
+        try:
             response = await self.safe_request(client, "GET", url, session, resource_type)
-        return None if response is None else str(response.get("body") or "")
+        finally:
+            if close_client:
+                await client.aclose()
+        if response is None:
+            return None
+
+        body = str(response.get("body") or "")
+        if response.get("status") == 200 and self.cacheable_asset(resource_type, url):
+            asset_cache.set(url, body)
+        return body
 
     async def fetch_source_maps(self, script_url: str, source: str, session: BrowserSession, client: httpx.AsyncClient | None = None) -> list[dict[str, Any]]:
         maps = []
@@ -791,30 +820,45 @@ class BrowserObservationEngine:
             map_url = urljoin(script_url, reference.strip())
             if not self.safety.is_in_scope(map_url):
                 continue
-            close_client = False
-            if client is None:
-                client = httpx.AsyncClient(timeout=8.0, follow_redirects=False, trust_env=False, headers={"User-Agent": "PhantomScan-BrowserObservation/1.0"})
-                close_client = True
+            body = await self.fetch_text(map_url, session, "source_map", client)
+            if body is None:
+                continue
             try:
-                response = await self.safe_request(client, "GET", map_url, session, "source_map")
-                if response and response.get("status") == 200:
-                    body = str(response.get("body") or "")
-                    try:
-                        parsed = json.loads(body)
-                    except json.JSONDecodeError:
-                        parsed = {}
-                    maps.append(
-                        {
-                            "script": redact_url(script_url),
-                            "source_map": redact_url(map_url),
-                            "sources": [redact_sensitive(str(item), 500) for item in parsed.get("sources", [])[:50]] if isinstance(parsed, dict) else [],
-                            "exposed": True,
-                        }
-                    )
-            finally:
-                if close_client and client is not None:
-                    await client.aclose()
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                parsed = {}
+            maps.append(
+                {
+                    "script": redact_url(script_url),
+                    "source_map": redact_url(map_url),
+                    "sources": [redact_sensitive(str(item), 500) for item in parsed.get("sources", [])[:50]] if isinstance(parsed, dict) else [],
+                    "exposed": True,
+                }
+            )
         return maps
+
+    @staticmethod
+    def cacheable_asset(resource_type: str, url: str) -> bool:
+        parsed = urlsplit(url)
+        path = parsed.path.lower()
+        return resource_type in {"script", "source_map", "stylesheet", "style"} or path.endswith((".js", ".mjs", ".map", ".css"))
+
+    async def publish_asset_progress(self, url: str, index: int, total: int) -> None:
+        if total <= 0:
+            return
+        progress = 35 + int((index / total) * 10)
+        try:
+            await scan_event_broker.publish(
+                self.scan_id,
+                {
+                    "type": "browser_asset_scan",
+                    "phase": "asset_scan",
+                    "message": f"Checking {redact_url(url)}",
+                    "progress": min(45, progress),
+                },
+            )
+        except Exception:
+            logger.debug("Browser asset progress publish failed", exc_info=True)
 
     def compose_result(
         self,

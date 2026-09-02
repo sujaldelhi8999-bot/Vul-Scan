@@ -6,7 +6,7 @@ import { Check, Loader2, RotateCcw, ShieldCheck, Square } from 'lucide-react';
 import { usePhantomData } from '../../hooks/usePhantomData';
 import { useScanTelemetry } from '../../hooks/useScanTelemetry';
 import { apiErrorMessage, startScan, stopScan } from '../../services/api';
-import type { ScanIntensity, ScanMode, ScanResponse } from '../../types';
+import type { ScanDepth, ScanIntensity, ScanMode, ScanResponse } from '../../types';
 import { DEFEND_CHECKS } from '../../types';
 import {
   ActivityTimeline,
@@ -19,6 +19,7 @@ import {
   Panel,
   ProgressBar,
   SectionHeader,
+  Select,
   SeverityBadge,
   StatusBadge,
 } from '../../components/ui/Primitives';
@@ -32,11 +33,38 @@ const profiles: Array<{ id: ScanIntensity; label: string; description: string }>
   { id: 'high', label: 'Deep', description: 'Full passive analysis' },
 ];
 
+const scanDepths: Array<{ id: ScanDepth; label: string; description: string }> = [
+  { id: 'quick', label: 'Quick', description: 'Essential checks under 60s' },
+  { id: 'standard', label: 'Standard', description: 'All core checks' },
+  { id: 'deep', label: 'Deep', description: 'Full path enumeration' },
+  { id: 'stealth', label: 'Stealth', description: 'Browser-like headers and pacing' },
+];
+
+function confidencePercent(finding: ScanResponse['findings'][number]): number {
+  if (typeof finding.confidence_percent === 'number') return Math.max(0, Math.min(100, Math.round(finding.confidence_percent)));
+  if (typeof finding.confidence_score === 'number') return Math.max(0, Math.min(100, Math.round(finding.confidence_score * 100)));
+  const fallback: Record<string, number> = { CONFIRMED: 100, HIGH: 85, MEDIUM: 65, LOW: 40, POTENTIAL: 25 };
+  return fallback[finding.confidence] ?? 0;
+}
+
+function isVerified(finding: ScanResponse['findings'][number]): boolean {
+  if (typeof finding.verified === 'boolean') return finding.verified;
+  return finding.confidence === 'CONFIRMED' || finding.verification_status === 'ISSUE_STILL_PRESENT';
+}
+
+function findingLocation(finding: ScanResponse['findings'][number]): string | null {
+  const location = finding.file_path || finding.endpoint;
+  if (!location) return null;
+  return finding.file_path && finding.line_number ? `${finding.file_path}:${finding.line_number}` : location;
+}
+
 export default function LiveScanPage() {
   const navigate = useNavigate();
   const { refresh, scans, executionStatus, executionActive } = usePhantomData();
   const [target, setTarget] = useState('');
   const [profile, setProfile] = useState<ScanIntensity>('medium');
+  const [scanDepth, setScanDepth] = useState<ScanDepth>('quick');
+  const [confidenceProfile, setConfidenceProfile] = useState<'strict' | 'balanced' | 'aggressive'>('balanced');
   const [mode, setMode] = useState<ScanMode>('defend');
   const [enableExploitation, setEnableExploitation] = useState(false);
   const [enableAIExploitation, setEnableAIExploitation] = useState(false);
@@ -48,6 +76,8 @@ export default function LiveScanPage() {
   const displayFindings = telemetry.findings.length ? telemetry.findings : activeScan?.findings ?? [];
   const counts = countBySeverity(displayFindings);
   const currentStatus = telemetry.scanStatus ?? activeScan?.status;
+  const displayProgress = telemetry.progress ?? activeScan?.progress ?? 0;
+  const displayRequestCount = telemetry.requestCount ?? activeScan?.request_count ?? 0;
   const terminal = currentStatus
     ? ['complete', 'error', 'cancelled'].includes(currentStatus)
     : false;
@@ -98,7 +128,10 @@ export default function LiveScanPage() {
       const scan = await startScan({
         target_url: formattedTarget,
         mode,
+        scan_depth: scanDepth,
+        profile: scanDepth,
         intensity: profile,
+        confidence_profile: confidenceProfile,
         enable_exploitation: mode === 'pentest' ? enableExploitation : undefined,
         enable_ai_exploitation: mode === 'pentest' ? enableAIExploitation : undefined,
         selected_tests:
@@ -232,6 +265,43 @@ export default function LiveScanPage() {
                   </button>
                 </div>
               </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-[var(--text-default)]">Enumeration Depth</label>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  {scanDepths.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => setScanDepth(item.id)}
+                      disabled={Boolean(activeScan && !terminal)}
+                      className={`rounded-lg border p-2.5 text-left text-xs transition-colors ${
+                        scanDepth === item.id
+                          ? 'border-[var(--brand)] bg-[var(--brand-soft)]'
+                          : 'border-[var(--border-light)] hover:bg-[var(--surface-hover)]'
+                      }`}
+                    >
+                      <div className="font-semibold text-[var(--text-strong)]">{item.label}</div>
+                      <div className="mt-0.5 text-[10px] text-[var(--text-muted)]">{item.description}</div>
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1 text-[10px] text-[var(--text-subtle)]">
+                  Quick keeps routine scans fast. Standard runs all core checks. Deep adds specialised checks. Stealth adds browser-like request shaping when enabled on the backend.
+                </p>
+              </div>
+              <div>
+                <label className="mb-1.5 block text-xs font-medium text-[var(--text-default)]">Confidence Sensitivity</label>
+                <Select
+                  value={confidenceProfile}
+                  onChange={(event) => setConfidenceProfile(event.target.value as 'strict' | 'balanced' | 'aggressive')}
+                  disabled={Boolean(activeScan && !terminal)}
+                >
+                  <option value="strict">Strict - fewer findings, highest proof</option>
+                  <option value="balanced">Balanced - default precision</option>
+                  <option value="aggressive">Aggressive - include weaker signals</option>
+                </Select>
+                <p className="mt-1 text-[10px] text-[var(--text-subtle)]">Controls how verifier scores become HIGH/MEDIUM/LOW labels for this scan.</p>
+              </div>
               <div
                 className={`rounded-lg border p-3 space-y-2.5 transition-opacity ${
                   mode === 'pentest'
@@ -342,12 +412,12 @@ export default function LiveScanPage() {
                   <div>
                     <div className="flex items-center justify-between text-xs mb-1.5">
                       <span className="text-[var(--text-muted)]">Progress</span>
-                      <span className="font-medium text-[var(--text-strong)]">{telemetry.progress || activeScan.progress}%</span>
+                      <span className="font-medium text-[var(--text-strong)]">{displayProgress}%</span>
                     </div>
-                    <ProgressBar value={telemetry.progress || activeScan.progress} />
+                    <ProgressBar value={displayProgress} />
                   </div>
                   <div className="flex gap-4 text-[11px] text-[var(--text-muted)]">
-                    <span>{telemetry.requestCount || activeScan.request_count} requests</span>
+                    <span>{displayRequestCount} requests</span>
                     <span>{telemetry.connectionState}</span>
                     <span>{displayFindings.length} findings</span>
                   </div>
@@ -366,13 +436,31 @@ export default function LiveScanPage() {
                 <SectionHeader title="Findings" description={`${displayFindings.length} total`} />
                 <div className="p-4">
                   {displayFindings.length ? (
-                    <div className="space-y-1">
-                      {displayFindings.slice(-8).reverse().map((finding) => (
-                        <div key={finding.id} className="flex items-center gap-3 rounded-lg px-3 py-2 hover:bg-[var(--surface-hover)]">
-                          <SeverityBadge severity={finding.severity} compact />
-                          <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--text-strong)]">{finding.title}</span>
-                          <span className="shrink-0 text-[11px] text-[var(--text-muted)] hidden sm:inline">{finding.category}</span>
-                          <StatusBadge status="Open" />
+                    <div className="space-y-2">
+                      {displayFindings.slice(-12).reverse().map((finding) => (
+                        <div key={finding.id} className="rounded-lg border border-[var(--border-light)] px-3 py-2.5 transition-colors hover:bg-[var(--surface-hover)]">
+                          <div className="flex items-start gap-3">
+                            <SeverityBadge severity={finding.severity} compact />
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate text-xs font-semibold text-[var(--text-strong)]">{finding.title}</div>
+                              <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-[var(--text-muted)]">
+                                <span>{finding.category}</span>
+                                {finding.agent ? <span>{finding.agent}</span> : null}
+                                {findingLocation(finding) ? <span className="max-w-full truncate font-mono">{findingLocation(finding)}</span> : null}
+                              </div>
+                            </div>
+                            <StatusBadge status={isVerified(finding) ? 'Verified' : finding.verification_status || 'Open'} />
+                          </div>
+                          <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px] text-[var(--text-muted)]">
+                            <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5">Confidence {confidencePercent(finding)}%</span>
+                            {finding.confidence_label ? <span>{finding.confidence_label}</span> : <span>{finding.confidence}</span>}
+                            {finding.request_id ? <span className="font-mono">request {finding.request_id}</span> : null}
+                          </div>
+                          {finding.code_snippet ? (
+                            <pre className="mt-2 max-h-24 overflow-auto rounded bg-[var(--surface-secondary)] p-2 text-[10px] text-[var(--text-muted)]">
+                              {finding.code_snippet}
+                            </pre>
+                          ) : null}
                         </div>
                       ))}
                     </div>

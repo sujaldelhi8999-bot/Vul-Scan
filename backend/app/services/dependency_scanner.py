@@ -5,7 +5,6 @@ Ported from VULSCAN. Integrates with OSV API (free, no rate limit) and NVD API
 (rate-limited: 1 request per 6 seconds).
 """
 
-import asyncio
 import json
 import logging
 import re
@@ -98,19 +97,64 @@ def _parse_cvss_from_nvd(cve_data: dict) -> tuple[float, str]:
     return 0.0, "unknown"
 
 
+_EXACT_VERSION_RE = re.compile(r"^\s*v?(\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?)\s*$")
+
+
+def _exact_version(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = _EXACT_VERSION_RE.match(value)
+    return match.group(1) if match else None
+
+
 def parse_package_json(content: str) -> list[tuple[str, str]]:
+    """Parse pinned package.json dependencies only.
+
+    Ranges such as ^1.2.3 or >=1.2.3 do not identify the installed version;
+    querying OSV with the stripped lower bound creates dependency false positives.
+    Lockfiles are parsed separately when present.
+    """
     deps = []
     try:
         data = json.loads(content)
         for section in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
             for name, version in data.get(section, {}).items():
-                clean = re.sub(r"[\^~>=<*x]", "", version).strip()
-                if not clean:
-                    clean = "0.0.0"
-                deps.append((name, clean))
+                clean = _exact_version(version)
+                if clean:
+                    deps.append((name, clean))
     except (json.JSONDecodeError, TypeError):
         pass
     return deps
+
+
+def parse_package_lock_json(content: str) -> list[tuple[str, str]]:
+    deps: dict[str, str] = {}
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+    packages = data.get("packages")
+    if isinstance(packages, dict):
+        for package_path, meta in packages.items():
+            if not package_path or not isinstance(meta, dict):
+                continue
+            name = meta.get("name")
+            if not name and "node_modules/" in package_path:
+                name = package_path.rsplit("node_modules/", 1)[-1]
+            version = _exact_version(meta.get("version"))
+            if name and version:
+                deps[str(name)] = version
+
+    dependencies = data.get("dependencies")
+    if isinstance(dependencies, dict):
+        for name, meta in dependencies.items():
+            if isinstance(meta, dict):
+                version = _exact_version(meta.get("version"))
+                if version:
+                    deps[str(name)] = version
+
+    return sorted(deps.items())
 
 
 def parse_requirements_txt(content: str) -> list[tuple[str, str]]:
@@ -119,13 +163,46 @@ def parse_requirements_txt(content: str) -> list[tuple[str, str]]:
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
             continue
-        match = re.match(r"^([a-zA-Z0-9_.\-]+)\s*(==|>=|<=|~=|!=|>|<|===)\s*([a-zA-Z0-9_.\-]+)", line)
+        match = re.match(r"^([a-zA-Z0-9_.\-]+)\s*(==|===)\s*([a-zA-Z0-9_.\-]+)", line)
         if match:
             deps.append((match.group(1), match.group(3)))
-        else:
-            match = re.match(r"^([a-zA-Z0-9_.\-]+)", line)
-            if match:
-                deps.append((match.group(1), "0.0.0"))
+    return deps
+
+
+def parse_pipfile_lock(content: str) -> list[tuple[str, str]]:
+    deps = []
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return deps
+    for section in ("default", "develop"):
+        packages = data.get(section, {})
+        if not isinstance(packages, dict):
+            continue
+        for name, meta in packages.items():
+            version = meta.get("version") if isinstance(meta, dict) else None
+            if isinstance(version, str) and version.startswith("=="):
+                deps.append((name, version[2:]))
+    return deps
+
+
+def parse_poetry_lock(content: str) -> list[tuple[str, str]]:
+    deps = []
+    current: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if line == "[[package]]":
+            if current.get("name") and current.get("version"):
+                deps.append((current["name"], current["version"]))
+            current = {}
+            continue
+        if "=" not in line:
+            continue
+        key, value = [part.strip() for part in line.split("=", 1)]
+        if key in {"name", "version"}:
+            current[key] = value.strip('"\'')
+    if current.get("name") and current.get("version"):
+        deps.append((current["name"], current["version"]))
     return deps
 
 
@@ -143,7 +220,8 @@ def parse_pipfile(content: str) -> list[tuple[str, str]]:
         if in_packages and "=" in stripped:
             parts = stripped.split("=", 1)
             name = parts[0].strip().strip('"').strip("'")
-            version = re.sub(r"[\^~>=<*]", "", parts[1].strip().strip('"').strip("'")).strip()
+            raw_version = parts[1].strip().strip('"').strip("'")
+            version = raw_version[2:] if raw_version.startswith("==") else _exact_version(raw_version)
             if name and version:
                 deps.append((name, version))
     return deps
@@ -176,11 +254,20 @@ class DependencyScanner:
         if name == "package.json":
             deps = parse_package_json(content)
             ecosystem = "npm"
-        elif name == "requirements.txt":
+        elif name in {"package-lock.json", "npm-shrinkwrap.json"}:
+            deps = parse_package_lock_json(content)
+            ecosystem = "npm"
+        elif name.startswith("requirements") and name.endswith(".txt"):
             deps = parse_requirements_txt(content)
             ecosystem = "PyPI"
         elif name == "pipfile":
             deps = parse_pipfile(content)
+            ecosystem = "PyPI"
+        elif name == "pipfile.lock":
+            deps = parse_pipfile_lock(content)
+            ecosystem = "PyPI"
+        elif name == "poetry.lock":
+            deps = parse_poetry_lock(content)
             ecosystem = "PyPI"
         else:
             result.errors.append(f"Unsupported dependency file: {name}")

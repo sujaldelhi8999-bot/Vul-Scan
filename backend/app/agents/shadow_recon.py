@@ -9,6 +9,7 @@ import httpx
 import whois
 
 from app.agents import Agent
+from app.websockets import scan_event_broker
 
 logger = logging.getLogger("phantomscan.shadow_recon")
 
@@ -100,6 +101,33 @@ DIRECTORY_WORDLIST = [
     "/api/config", "/api/v1/docs", "/api/v1/health", "/graphql/console",
 ]
 
+QUICK_DIRECTORY_WORDLIST = [
+    "/",
+    "/robots.txt",
+    "/sitemap.xml",
+    "/favicon.ico",
+    "/.well-known/security.txt",
+    "/.env",
+    "/.env.local",
+    "/.env.production",
+    "/.env.example",
+    "/.git/HEAD",
+    "/.git/config",
+    "/package.json",
+    "/package-lock.json",
+    "/composer.json",
+    "/composer.lock",
+    "/wp-config.php",
+    "/wp-login.php",
+    "/wp-admin/",
+    "/phpmyadmin/",
+    "/adminer.php",
+    "/server-status",
+    "/api/health",
+    "/health",
+    "/status",
+]
+
 API_PATTERNS = [
     "/api", "/api/v1", "/api/v2", "/api/v3",
     "/rest", "/rest/v1", "/rest/v2",
@@ -153,25 +181,36 @@ class ShadowReconAgent(Agent):
     def __init__(self) -> None:
         super().__init__("Shadow Recon Agent")
 
-    async def run(self, target_url: str, scan_id: int) -> dict[str, Any]:
+    async def run(self, target_url: str, scan_id: int, *, scan_depth: str = "quick") -> dict[str, Any]:
         self.scan_id = scan_id
         self.status = "active"
-        await self.log_action("started", f"Shadow recon for {target_url}")
+        depth = "deep" if scan_depth == "deep" else "quick"
+        await self.log_action("started", f"Shadow recon for {target_url} ({depth} depth)")
 
         domain = self._extract_domain(target_url)
         base = target_url if "://" in target_url else f"https://{target_url}"
 
-        whois_data = await self._lookup_whois(domain)
         dork_urls = self._build_dorks(domain)
-        robots = await self._fetch_path(base, "/robots.txt")
-        sitemap = await self._fetch_path(base, "/sitemap.xml")
-        wayback_urls = await self._fetch_wayback_urls(domain)
-        crtsh_subdomains = await self._fetch_crtsh_subdomains(domain)
+        fetch_timeout = 3.0 if depth == "quick" else 8.0
+        robots, sitemap, homepage = await asyncio.gather(
+            self._fetch_path(base, "/robots.txt", timeout=fetch_timeout),
+            self._fetch_path(base, "/sitemap.xml", timeout=fetch_timeout),
+            self._fetch_path(base, "", timeout=fetch_timeout),
+        )
+        if depth == "deep":
+            whois_data, wayback_urls, crtsh_subdomains = await asyncio.gather(
+                self._lookup_whois(domain),
+                self._fetch_wayback_urls(domain),
+                self._fetch_crtsh_subdomains(domain),
+            )
+        else:
+            whois_data = {}
+            wayback_urls = []
+            crtsh_subdomains = []
 
         disallowed = self._parse_robots(robots.get("body", ""))
         sitemap_urls = self._parse_sitemap(sitemap.get("body", ""))
 
-        homepage = await self._fetch_path(base, "")
         body = homepage.get("body", "")
         leaked_emails = self._extract_emails(body)
         js_sourcemaps = self._extract_sourcemaps(body, base)
@@ -180,13 +219,39 @@ class ShadowReconAgent(Agent):
         phones = self._extract_phones(body)
         social_profiles = self._extract_social(body)
 
-        extra_scan_paths = [p for p in disallowed if p not in DIRECTORY_WORDLIST and p.startswith("/")]
+        base_paths = self._path_wordlist(depth)
+        extra_scan_paths = [p for p in disallowed if p not in base_paths and p.startswith("/")] if depth == "deep" else []
+        paths_to_check = base_paths + extra_scan_paths
+        await self._publish_progress(
+            "shadow_recon_enumeration",
+            {
+                "phase": "enumeration",
+                "scan_depth": depth,
+                "message": f"{'Deep enumeration' if depth == 'deep' else 'Quick check'}: checking {len(paths_to_check)} paths",
+                "path_count": len(paths_to_check),
+            },
+        )
         try:
-            async with asyncio.timeout(90.0):
-                discovered_files = await self._brute_force_paths(base, DIRECTORY_WORDLIST + extra_scan_paths)
+            async with asyncio.timeout(90.0 if depth == "deep" else 15.0):
+                discovered_files = await self._brute_force_paths(
+                    base,
+                    paths_to_check,
+                    concurrency=20 if depth == "deep" else 8,
+                    request_timeout=3.0 if depth == "deep" else 2.5,
+                )
         except asyncio.TimeoutError:
-            logger.warning("Path brute-force timed out after 90s, continuing with partial results")
+            logger.warning("%s path enumeration timed out, continuing with partial results", depth.capitalize())
             discovered_files = []
+        await self._publish_progress(
+            "shadow_recon_enumeration_complete",
+            {
+                "phase": "enumeration",
+                "scan_depth": depth,
+                "message": f"{depth.capitalize()} enumeration complete: {len(discovered_files)} paths responded",
+                "path_count": len(paths_to_check),
+                "found_count": len(discovered_files),
+            },
+        )
 
         fetched_bodies = 0
         for entry in discovered_files:
@@ -211,13 +276,17 @@ class ShadowReconAgent(Agent):
 
         exposed_files = [e for e in discovered_files if e.get("status_code") in (200, 301, 302)]
 
-        try:
-            async with asyncio.timeout(90.0):
-                apis = await self._discover_apis(base, hint_bodies=[body, robots.get("body", ""), sitemap.get("body", "")])
-        except asyncio.TimeoutError:
-            logger.warning("API discovery timed out after 90s, continuing with partial results")
+        if depth == "deep":
+            try:
+                async with asyncio.timeout(90.0):
+                    apis = await self._discover_apis(base, hint_bodies=[body, robots.get("body", ""), sitemap.get("body", "")])
+            except asyncio.TimeoutError:
+                logger.warning("API discovery timed out after 90s, continuing with partial results")
+                apis = []
+            graphql = await self._introspect_graphql(base)
+        else:
             apis = []
-        graphql = await self._introspect_graphql(base)
+            graphql = None
 
         leaked_emails = list(dict.fromkeys(leaked_emails))
         internal_ips = list(dict.fromkeys(internal_ips))
@@ -256,6 +325,7 @@ class ShadowReconAgent(Agent):
             f"Social: {len(social_profiles)}, "
             f"Sourcemaps: {len(js_sourcemaps)}, "
             f"Files: {len(discovered_files)}, "
+            f"Depth: {depth}, "
             f"APIs: {len(apis)}, "
             f"GraphQL: {'enabled' if graphql else 'disabled'}, "
             f"Wayback URLs: {len(wayback_urls)}, "
@@ -282,6 +352,8 @@ class ShadowReconAgent(Agent):
             "wayback_urls": wayback_urls[:200],
             "crtsh_subdomains": crtsh_subdomains,
             "all_subdomains": all_subdomains,
+            "scan_depth": depth,
+            "enumerated_path_count": len(paths_to_check),
         }
 
         await self._save_artifacts(result)
@@ -366,9 +438,9 @@ class ShadowReconAgent(Agent):
     def _build_dorks(self, domain: str) -> list[str]:
         return [q.format(domain=domain) for q in DORK_QUERIES]
 
-    async def _fetch_path(self, base: str, path: str) -> dict[str, Any]:
+    async def _fetch_path(self, base: str, path: str, *, timeout: float = 8.0) -> dict[str, Any]:
         url = urljoin(base.rstrip("/") + "/", path.lstrip("/"))
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, verify=False) as c:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False) as c:
             try:
                 r = await c.get(url, headers={"User-Agent": "PhantomScan/1.0"})
                 return {"url": url, "status_code": r.status_code, "body": r.text[:50000]}
@@ -506,38 +578,59 @@ class ShadowReconAgent(Agent):
     def _extract_html_comments(self, body: str) -> list[str]:
         return re.findall(r"<!--(.*?)-->", body, re.DOTALL)
 
-    async def _brute_force_paths(self, base: str, paths: list[str]) -> list[dict[str, Any]]:
+    @staticmethod
+    def _path_wordlist(scan_depth: str) -> list[str]:
+        paths = DIRECTORY_WORDLIST if scan_depth == "deep" else QUICK_DIRECTORY_WORDLIST
+        return list(dict.fromkeys(paths))
+
+    async def _publish_progress(self, event: str, payload: dict[str, Any]) -> None:
+        try:
+            await scan_event_broker.publish(
+                self.scan_id,
+                {"event": event, "type": event, "payload": {"agent": "shadow_recon", **payload}},
+            )
+        except Exception as exc:
+            logger.debug("Failed to publish shadow recon progress: %s", exc)
+
+    async def _brute_force_paths(
+        self,
+        base: str,
+        paths: list[str],
+        *,
+        concurrency: int = 12,
+        request_timeout: float = 5.0,
+    ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
-        sem = asyncio.Semaphore(12)
+        sem = asyncio.Semaphore(concurrency)
         base_url = base.rstrip("/")
 
-        async def check(path: str) -> None:
+        async def check(client: httpx.AsyncClient, path: str) -> None:
             async with sem:
                 url = urljoin(base_url + "/", path.lstrip("/"))
                 try:
-                    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False, verify=False) as c:
-                        r = await c.get(url, headers={"User-Agent": "PhantomScan/1.0"})
-                        if r.status_code == 404 or r.status_code == 405:
-                            return
-                        headers = {k.lower(): v for k, v in r.headers.items()}
-                        results.append({
-                            "path": path,
-                            "url": url,
-                            "status_code": r.status_code,
-                            "content_type": headers.get("content-type", ""),
-                            "size": len(r.content),
-                            "redirect": headers.get("location"),
-                            "server": headers.get("server"),
-                            "last_modified": headers.get("last-modified"),
-                            "snippet": r.text[:200] if r.status_code in (200, 403) else "",
-                        })
+                    r = await client.get(url, headers={"User-Agent": "PhantomScan/1.0"})
+                    if r.status_code == 404 or r.status_code == 405:
+                        return
+                    headers = {k.lower(): v for k, v in r.headers.items()}
+                    results.append({
+                        "path": path,
+                        "url": url,
+                        "status_code": r.status_code,
+                        "content_type": headers.get("content-type", ""),
+                        "size": len(r.content),
+                        "redirect": headers.get("location"),
+                        "server": headers.get("server"),
+                        "last_modified": headers.get("last-modified"),
+                        "snippet": r.text[:200] if r.status_code in (200, 403) else "",
+                    })
                 except Exception as e:
                     logger.debug("Brute force check failed for %s: %s", url, e)
 
-        chunk_size = 60
-        for i in range(0, len(paths), chunk_size):
-            chunk = paths[i:i + chunk_size]
-            await asyncio.gather(*[check(p) for p in chunk], return_exceptions=True)
+        chunk_size = max(60, concurrency * 5)
+        async with httpx.AsyncClient(timeout=request_timeout, follow_redirects=False, verify=False) as client:
+            for i in range(0, len(paths), chunk_size):
+                chunk = paths[i:i + chunk_size]
+                await asyncio.gather(*[check(client, p) for p in chunk], return_exceptions=True)
 
         results.sort(key=lambda e: e["status_code"])
         return results

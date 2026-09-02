@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.auth_middleware import get_current_user
 from app.agents.orchestrator import OrchestratorAgent
 from app.config import get_settings
-from app.database import add_audit_log, get_connection, get_findings, get_scan, update_scan_status
+from app.database import add_audit_log, get_connection, get_findings, update_scan_status
 from app.models import GitHubConfig, MultiSourceScanRequest
 from app.routers.multi_source import build_response
 from app.security import decrypt_data
@@ -22,6 +22,26 @@ from app.services.enterprise_access import enterprise_id_for, filter_findings_fo
 router = APIRouter(prefix="/api/sast", tags=["SAST"])
 settings = get_settings()
 logger = logging.getLogger("phantomscan.sast")
+
+DEFAULT_SAST_EXCLUDE_PATTERNS = [
+    "**/*.md",
+    "**/*.rst",
+    "**/docs/**",
+    "**/documentation/**",
+    "**/examples/**",
+    "**/sample/**",
+    "**/samples/**",
+    "**/tests/**",
+    "**/test/**",
+    "**/__tests__/**",
+    "**/fixtures/**",
+    "**/fonts/**",
+    "**/i18n/**",
+    "**/locales/**",
+    "**/data/**",
+    "**/*.min.js",
+    "**/*.map",
+]
 
 
 async def _connected_oauth_token(user_id: str) -> str | None:
@@ -69,7 +89,8 @@ async def scan_repo(
     except ScanCapacityError as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
 
-    excludes = [p.strip() for p in exclude_patterns.split(",") if p.strip()] if exclude_patterns else []
+    user_excludes = [p.strip() for p in exclude_patterns.split(",") if p.strip()] if exclude_patterns else []
+    excludes = list(dict.fromkeys([*DEFAULT_SAST_EXCLUDE_PATTERNS, *user_excludes]))
 
     scan_id: int | None = None
     try:
@@ -84,7 +105,7 @@ async def scan_repo(
                 repo_url=repo_url,
                 branch=branch,
                 pat_token=pat_token,
-                include_dependabot=False,
+                include_dependabot=True,
                 exclude_patterns=excludes,
                 scan_timeout=scan_timeout if scan_timeout > 0 else None,
             )],
@@ -93,7 +114,6 @@ async def scan_repo(
             generate_sarif=False,
             generate_pdf=False,
         )
-        orchestrator = OrchestratorAgent(limits=scan_job_manager.limits)
         scan_id = await _create_sast_scan(repo_url, branch, user["id"], enterprise_id_for(user))
         await add_audit_log(
             scan_id,
@@ -112,7 +132,7 @@ async def scan_repo(
     finally:
         await asyncio.shield(scan_job_manager.release_slot(reservation))
 
-    return {"scan_id": scan_id, "status": "queued", "repo_url": repo_url, "branch": branch}
+    return {"scan_id": scan_id, "status": "queued", "repo_url": repo_url, "branch": branch, "exclude_patterns": excludes}
 
 
 async def _create_sast_scan(repo_url: str, branch: str, user_id: str, enterprise_id: str | None = None) -> int:

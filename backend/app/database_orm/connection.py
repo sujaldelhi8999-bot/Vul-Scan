@@ -12,7 +12,11 @@ from app.database_orm.base import Base
 
 
 class DatabaseManager:
-    """Manages database connections and sessions."""
+    """Manages future SQLAlchemy database connections and sessions.
+
+    The current runtime path uses ``app.database`` with SQLite. This manager is
+    retained for the later PostgreSQL migration and is not active by default.
+    """
 
     def __init__(self) -> None:
         self._engine: Optional[AsyncEngine] = None

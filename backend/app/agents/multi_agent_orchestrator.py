@@ -41,6 +41,7 @@ from app.database import (
     add_audit_log,
     complete_agent_run,
     list_applied_tunings,
+    safe_int,
     set_scan_artifacts,
     start_agent_run,
 )
@@ -149,7 +150,11 @@ class ReconAgent(Agent):
             self.runner.run_agent(
                 "shadow_recon",
                 shadow_recon.name,
-                lambda: shadow_recon.run(context.target_url, context.scan_id),
+                lambda: shadow_recon.run(
+                    context.target_url,
+                    context.scan_id,
+                    scan_depth=context.scan_request.scan_depth,
+                ),
                 context.scan_id,
             ),
         )
@@ -257,7 +262,7 @@ class AttackAgent(Agent):
                 self.runner.run_agent(
                     event_name,
                     agent.name,
-                    lambda: agent.run(target_url, scan_id, scanner_output, shadow_output),
+                    lambda agent=agent: agent.run(target_url, scan_id, scanner_output, shadow_output),
                     scan_id,
                 )
             )
@@ -299,7 +304,7 @@ class AttackAgent(Agent):
                 "selected_modules": ai_decision or scan_request.selected_tests or planned_modules or [],
                 "selected_tests": scan_request.selected_tests,
                 "business_logic_tests": business_logic_tests,
-                "workflow_rules": {"business_logic_tests": business_logic_tests},
+                "workflow_rules": {"business_logic_tests": business_logic_tests, "confidence_profile": scan_request.confidence_profile},
                 "user_id": context.user_id,
                 "authorization_id": (context.authorization_context or {}).get("authorization_id"),
                 "authorization_context": context.authorization_context,
@@ -313,7 +318,13 @@ class AttackAgent(Agent):
                 )
             )
 
-        attack_events = await self.runner.gather_agents(*attack_tasks)
+        attack_events = await self.runner.gather_agents(
+            *attack_tasks,
+            scan_id=scan_id,
+            phase="analysis_running",
+            start_progress=30,
+            end_progress=65,
+        )
         active_result = next(
             (
                 event["result"]
@@ -360,7 +371,7 @@ class AttackAgent(Agent):
                 },
             )
         request_count = max(
-            (int(event["result"].get("request_count", 0)) for event in attack_events),
+            (count for event in attack_events if (count := safe_int(event["result"].get("request_count"))) is not None),
             default=0,
         )
         sandbox_id = next(
@@ -381,13 +392,24 @@ class AttackAgent(Agent):
         findings = context.host.collect_findings(attack_events, target_url)
 
         ai_explainer = AIExplainerAgent()
-        ai_event = await self.runner.run_agent(
-            "ai_explainer",
-            ai_explainer.name,
-            lambda: ai_explainer.run(findings, scan_id),
-            scan_id,
-        )
-        enriched_findings = ai_event["result"].get("findings", findings)
+        try:
+            ai_event = await self.runner.run_agent(
+                "ai_explainer",
+                ai_explainer.name,
+                lambda: ai_explainer.run(findings, scan_id),
+                scan_id,
+                max_retries=0,
+                timeout=20.0,
+            )
+            enriched_findings = ai_event["result"].get("findings", findings)
+        except asyncio.TimeoutError:
+            await context.host.log_action("ai_explainer_timeout", "AI explainer timed out; continuing with deterministic findings")
+            await context.host.publish(scan_id, "ai_explainer_timeout", {"status": "timeout", "message": "AI explainer timed out; using fallback findings", "progress": 78})
+            enriched_findings = findings
+        except Exception as exc:
+            await context.host.log_action("ai_explainer_error", str(exc)[:2000])
+            await context.host.publish(scan_id, "ai_explainer_error", {"status": "error", "message": "AI explainer failed; using fallback findings", "error": str(exc)[:500], "progress": 78})
+            enriched_findings = findings
         await context.host.set_progress(scan_id, 78, "explanations_complete", request_count=request_count)
 
         persisted_findings = await context.host.persist_findings(scan_id, enriched_findings, target_url)
@@ -426,7 +448,7 @@ class ExploitAgent(Agent):
         target_url = context.target_url
         attack = context.stages["attack"]
         persisted_findings = attack["persisted_findings"]
-        request_count = attack.get("request_count") or 0
+        request_count = safe_int(attack.get("request_count"), 0) or 0
 
         exploitation_result = None
         ai_exploitation_result = None
@@ -485,7 +507,7 @@ class ReportAgent(Agent):
         attack = context.stages["attack"]
         exploit = context.stages["exploit"]
         persisted_findings = attack["persisted_findings"]
-        request_count = attack.get("request_count") or 0
+        request_count = safe_int(attack.get("request_count"), 0) or 0
         active_result = attack["active_result"]
         browser_result = attack["browser_result"]
 
@@ -705,14 +727,47 @@ class MultiAgentOrchestrator:
         )
         raise last_exc or RuntimeError(f"{agent_name} failed")
 
-    async def gather_agents(self, *operations: Awaitable[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def gather_agents(
+        self,
+        *operations: Awaitable[dict[str, Any]],
+        scan_id: int | None = None,
+        phase: str = "agents_running",
+        start_progress: int | None = None,
+        end_progress: int | None = None,
+    ) -> list[dict[str, Any]]:
         tasks = [asyncio.create_task(operation) for operation in operations]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        cleaned: list[dict[str, Any]] = []
-        for i, r in enumerate(results):
-            if isinstance(r, BaseException):
-                logger.error("Agent task %d raised: %s", i, r)
-                cleaned.append({"error": str(r)[:500], "result": {}})
-            else:
-                cleaned.append(r)
-        return cleaned
+        results: list[dict[str, Any] | None] = [None] * len(tasks)
+        task_indexes = {task: i for i, task in enumerate(tasks)}
+        completed = 0
+
+        while task_indexes:
+            done, _ = await asyncio.wait(task_indexes.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                index = task_indexes.pop(task)
+                completed += 1
+                try:
+                    result = task.result()
+                except BaseException as exc:
+                    logger.error("Agent task %d raised: %s", index, exc)
+                    result = {"error": str(exc)[:500], "result": {}}
+                results[index] = result
+
+                if scan_id is not None and start_progress is not None and end_progress is not None and tasks:
+                    progress = start_progress + int((completed / len(tasks)) * (end_progress - start_progress))
+                    agent_name = str(result.get("agent_name") or result.get("agent") or f"agent {index + 1}")
+                    status_value = str(result.get("status") or "complete")
+                    await self.host.publish(
+                        scan_id,
+                        phase,
+                        {
+                            "phase": phase,
+                            "status": "running",
+                            "progress": min(end_progress, progress),
+                            "completed_agents": completed,
+                            "total_agents": len(tasks),
+                            "agent_name": agent_name,
+                            "message": f"{agent_name} {status_value}; {completed}/{len(tasks)} analysis agents complete",
+                        },
+                    )
+
+        return [result or {"error": "Agent did not return a result", "result": {}} for result in results]

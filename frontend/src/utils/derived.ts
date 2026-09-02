@@ -2,6 +2,28 @@ import type { AgentStatus, AuditLog, Finding, ScanArtifactsResponse, ScanHistory
 
 export const severityOrder: Severity[] = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'];
 
+function parseTimestamp(value?: string | null): Date | null {
+  if (!value) return null;
+  const normalized = /(?:z|[+-]\d{2}:?\d{2})$/i.test(value)
+    ? value
+    : `${value.replace(' ', 'T')}Z`;
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+export function scanDisplayTimestamp(scan: Pick<ScanHistoryItem | ScanResponse, 'created_at' | 'completed_at'>): string {
+  return scan.completed_at || scan.created_at;
+}
+
+function scanDisplayTime(scan: Pick<ScanHistoryItem | ScanResponse, 'created_at' | 'completed_at'>): number {
+  return parseTimestamp(scanDisplayTimestamp(scan))?.getTime() ?? 0;
+}
+
+function latestPostureScan(scans: ScanHistoryItem[]): ScanHistoryItem | undefined {
+  const sorted = [...scans].sort((a, b) => scanDisplayTime(b) - scanDisplayTime(a));
+  return sorted.find((scan) => scan.status === 'complete') ?? sorted[0];
+}
+
 function unresolved(findings: Finding[]): Finding[] {
   return findings.filter(
     (finding) =>
@@ -13,8 +35,8 @@ function unresolved(findings: Finding[]): Finding[] {
 
 export function formatDateTime(value?: string | null): string {
   if (!value) return 'Not available';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+  const date = parseTimestamp(value);
+  if (!date) return value;
   return new Intl.DateTimeFormat(undefined, {
     month: 'short',
     day: 'numeric',
@@ -25,8 +47,8 @@ export function formatDateTime(value?: string | null): string {
 
 export function relativeTime(value?: string | null): string {
   if (!value) return 'Never';
-  const time = new Date(value).getTime();
-  if (Number.isNaN(time)) return value;
+  const time = parseTimestamp(value)?.getTime();
+  if (time === undefined) return value;
   const seconds = Math.round((time - Date.now()) / 1000);
   const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
   const ranges: Array<[Intl.RelativeTimeFormatUnit, number]> = [
@@ -57,8 +79,16 @@ export function securityScore(findings: Finding[]): number {
   return Math.max(0, Math.min(100, 100 - penalty));
 }
 
+function scanHistoryScore(scan?: ScanHistoryItem): number {
+  if (!scan) return 100;
+  const critical = scan.critical_findings_count ?? 0;
+  const high = scan.high_findings_count ?? 0;
+  return Math.max(0, Math.min(100, 100 - critical * 24 - high * 14));
+}
+
 export function latestCompletedScan(scans: ScanHistoryItem[]): ScanHistoryItem | undefined {
-  return scans.find((scan) => scan.status === 'complete') ?? scans[0];
+  const completed = scans.filter((scan) => scan.status === 'complete');
+  return [...(completed.length ? completed : scans)].sort((a, b) => scanDisplayTime(b) - scanDisplayTime(a))[0];
 }
 
 export function targetName(targetUrl: string): string {
@@ -71,6 +101,7 @@ export function targetName(targetUrl: string): string {
 }
 
 export function deriveAssets(scans: ScanHistoryItem[], findings: Finding[]) {
+  const scansById = new Map(scans.map((scan) => [scan.id, scan]));
   const byTarget = new Map<string, { target_url: string; scans: ScanHistoryItem[]; findings: Finding[] }>();
   for (const scan of scans) {
     const key = targetName(scan.target_url);
@@ -79,22 +110,30 @@ export function deriveAssets(scans: ScanHistoryItem[], findings: Finding[]) {
     byTarget.set(key, current);
   }
   for (const finding of findings) {
-    const key = targetName(finding.target || finding.endpoint || 'unknown');
-    const current = byTarget.get(key) ?? { target_url: finding.target || key, scans: [], findings: [] };
+    const scan = scansById.get(finding.scan_id);
+    const targetUrl = scan?.target_url || finding.target || finding.endpoint || 'unknown';
+    const key = targetName(targetUrl);
+    const current = byTarget.get(key) ?? { target_url: targetUrl, scans: [], findings: [] };
     current.findings.push(finding);
     byTarget.set(key, current);
   }
   return [...byTarget.entries()].map(([name, asset]) => {
-    const latest = asset.scans[0];
-    const score = securityScore(asset.findings);
+    asset.scans.sort((a, b) => scanDisplayTime(b) - scanDisplayTime(a));
+    const latest = latestPostureScan(asset.scans);
+    const latestFindings = latest
+      ? asset.findings.filter((finding) => finding.scan_id === latest.id)
+      : asset.findings;
+    const findingsCount = latest?.findings_count ?? latestFindings.length;
+    const score = latestFindings.length ? securityScore(latestFindings) : scanHistoryScore(latest);
     return {
       name,
       target_url: asset.target_url,
       score,
-      findings: asset.findings,
+      findings: latestFindings,
+      findings_count: findingsCount,
       scans: asset.scans,
-      last_scan: latest?.created_at ?? null,
-      status: score >= 80 ? 'Healthy' : score >= 50 ? 'Attention Required' : 'Critical'
+      last_scan: latest ? scanDisplayTimestamp(latest) : null,
+      status: score >= 80 && findingsCount === 0 ? 'Healthy' : score >= 50 ? 'Attention Required' : 'Critical'
     };
   });
 }
@@ -153,9 +192,9 @@ export function agentSummary(agents: AgentStatus[]) {
 }
 
 export function scanDuration(scan: ScanHistoryItem | ScanResponse): string {
-  const start = new Date(scan.created_at).getTime();
-  const end = scan.completed_at ? new Date(scan.completed_at).getTime() : Date.now();
-  if (Number.isNaN(start) || Number.isNaN(end)) return 'Not available';
+  const start = parseTimestamp(scan.created_at)?.getTime();
+  const end = scan.completed_at ? parseTimestamp(scan.completed_at)?.getTime() : Date.now();
+  if (start === undefined || end === undefined || Number.isNaN(start) || Number.isNaN(end)) return 'Not available';
   const seconds = Math.max(0, Math.round((end - start) / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);

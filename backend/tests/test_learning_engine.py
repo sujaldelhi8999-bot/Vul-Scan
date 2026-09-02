@@ -1,12 +1,6 @@
 import json
-import os
-import tempfile
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
-
-_db_fd, _db_path = tempfile.mkstemp(suffix=".sqlite3")
-os.close(_db_fd)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 
 from app.database import (  # noqa: E402
     create_finding,

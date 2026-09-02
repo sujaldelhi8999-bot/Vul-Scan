@@ -9,7 +9,7 @@ import secrets
 import time
 from datetime import datetime, timedelta
 from typing import Any, Optional
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode
 
 import httpx
 
@@ -22,7 +22,6 @@ from app.models import (
     GitHubUserResponse,
     GitHubRepoResponse,
     GitHubWebhookPayload,
-    GitHubAppConfig,
 )
 from app.security import encrypt_data, decrypt_data
 
@@ -41,6 +40,16 @@ class GitHubService:
         self._app_id = self.settings.github_app_id
         self._app_private_key = self.settings.github_app_private_key
         self._webhook_secret = self.settings.github_webhook_secret
+
+    @staticmethod
+    def _response_message(response: httpx.Response, fallback: str) -> str:
+        try:
+            data = response.json()
+            if isinstance(data, dict) and data.get("message"):
+                return str(data["message"])
+        except Exception:
+            pass
+        return fallback
 
     # ============================================================
     # OAuth User Flow
@@ -143,6 +152,95 @@ class GitHubService:
             )
             response.raise_for_status()
             return GitHubRepoResponse(**response.json())
+
+    async def get_dependabot_alerts(
+        self,
+        access_token: str,
+        owner: str,
+        repo: str,
+        state: str = "open",
+        per_page: int = 100,
+    ) -> dict[str, Any]:
+        """Fetch Dependabot alerts when the token has access.
+
+        GitHub returns 403/404 when alerts are disabled or the token lacks the
+        required security-events access; that is captured as metadata instead of
+        failing the repository scan.
+        """
+        alerts: list[dict[str, Any]] = []
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        async with httpx.AsyncClient() as client:
+            page = 1
+            while True:
+                response = await client.get(
+                    f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/dependabot/alerts",
+                    headers=headers,
+                    params={"state": state, "per_page": per_page, "page": page},
+                )
+                if response.status_code in (403, 404):
+                    return {
+                        "available": False,
+                        "reason": self._response_message(response, "dependabot alerts unavailable"),
+                        "alerts": alerts,
+                        "rate_limit_remaining": response.headers.get("x-ratelimit-remaining"),
+                    }
+                response.raise_for_status()
+                page_alerts = response.json()
+                if not page_alerts:
+                    break
+                alerts.extend(page_alerts)
+                if len(page_alerts) < per_page:
+                    break
+                page += 1
+            return {
+                "available": True,
+                "alerts": alerts,
+                "rate_limit_remaining": response.headers.get("x-ratelimit-remaining") if 'response' in locals() else None,
+            }
+
+    async def get_branch_protection_status(
+        self,
+        access_token: str,
+        owner: str,
+        repo: str,
+        branch: str,
+    ) -> dict[str, Any]:
+        """Return branch protection state without making scan startup brittle."""
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/branches/{branch}/protection",
+                headers=headers,
+            )
+            if response.status_code == 404:
+                return {"available": True, "protected": False, "reason": "branch protection not configured"}
+            if response.status_code == 403:
+                return {"available": False, "protected": None, "reason": self._response_message(response, "branch protection unavailable")}
+            response.raise_for_status()
+            return {"available": True, "protected": True, "settings": response.json()}
+
+    async def get_repo_security_insights(
+        self,
+        access_token: str,
+        owner: str,
+        repo: str,
+        branch: str = "main",
+    ) -> dict[str, Any]:
+        """Collect GitHub-native security signals for repo scans."""
+        dependabot = await self.get_dependabot_alerts(access_token, owner, repo)
+        branch_protection = await self.get_branch_protection_status(access_token, owner, repo, branch)
+        return {
+            "dependabot": dependabot,
+            "branch_protection": branch_protection,
+        }
 
     async def get_repo_contents(
         self, access_token: str, owner: str, repo: str, path: str = "", ref: str | None = None

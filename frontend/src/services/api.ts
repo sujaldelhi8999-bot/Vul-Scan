@@ -58,7 +58,7 @@ import type {
 } from '../types';
 
 const configuredBaseUrl =
-  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 const baseUrl = configuredBaseUrl
   .replace(/\/api\/?$/, "")
@@ -76,7 +76,6 @@ apiClient.interceptors.request.use((config) => {
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
-  console.log('🔑 Token attached to request:', config.url);
   return config;
 });
 
@@ -224,10 +223,18 @@ export function apiErrorMessage(error: unknown, fallback = 'VulScan could not co
 export function getWebSocketUrl(path: string): string {
   const configured = import.meta.env.VITE_WS_BASE_URL as string | undefined;
   const webSocketBase = (configured || baseUrl.replace(/^http/, 'ws')).replace(/\/$/, '');
-  const token = localStorage.getItem('phantom_token');
   const wsPath = path.startsWith('/') ? path : '/' + path;
-  const tokenParam = token ? (wsPath.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token) : '';
-  return webSocketBase + wsPath + tokenParam;
+  return webSocketBase + wsPath;
+}
+
+export async function issueWebSocketTicket(scope: 'status' | 'scan' | 'brutal', scanId?: number | string): Promise<{ ticket: string; expires_at: string; scope: string; scan_id?: number | null }> {
+  const response = await apiClient.post('/api/auth/ws-ticket', { scope, scan_id: scanId === undefined ? undefined : Number(scanId) });
+  return response.data;
+}
+
+export async function createAuthenticatedWebSocket(path: string, scope: 'status' | 'scan' | 'brutal', scanId?: number | string): Promise<WebSocket> {
+  const ticket = await issueWebSocketTicket(scope, scanId);
+  return new WebSocket(getWebSocketUrl(path), ['phantomscan.ws-ticket', `ticket.${ticket.ticket}`]);
 }
 
 export async function getHealth(): Promise<HealthResponse> {
@@ -236,8 +243,8 @@ export async function getHealth(): Promise<HealthResponse> {
 }
 
 export async function getScanHistory(): Promise<ScanHistoryItem[]> {
-  const response = await apiClient.get<ScanHistoryItem[]>('/api/scan/history');
-  return response.data;
+  const response = await apiClient.get<ScanHistoryItem[] | { scans: ScanHistoryItem[] }>('/api/scan/history');
+  return Array.isArray(response.data) ? response.data : response.data.scans;
 }
 
 export async function getScan(id: number | string): Promise<ScanResponse> {
@@ -248,6 +255,14 @@ export async function getScan(id: number | string): Promise<ScanResponse> {
 export async function getScanArtifacts(id: number | string): Promise<ScanArtifactsResponse> {
   const response = await apiClient.get<ScanArtifactsResponse>(`/api/scan/${id}/artifacts`);
   return response.data;
+}
+
+export async function getScanArtifactsBatch(ids: Array<number | string>): Promise<Record<number, ScanArtifactsResponse>> {
+  if (!ids.length) return {};
+  const response = await apiClient.get<Record<string, ScanArtifactsResponse>>('/api/artifacts/batch', {
+    params: { scan_ids: ids.join(',') },
+  });
+  return Object.fromEntries(Object.entries(response.data).map(([id, artifact]) => [Number(id), artifact]));
 }
 
 export async function getAIAnalysis(id: number | string, refresh = false): Promise<AISecurityAnalystOutput> {
@@ -365,8 +380,9 @@ export async function getFindings(
       ...(options?.limit ? { limit: options.limit } : {}),
       ...(options?.offset ? { offset: options.offset } : {}),
       ...(options?.includeDetails ? { include_details: true } : {}),
-    },
-  });
+  },
+});
+
   return response.data;
 }
 

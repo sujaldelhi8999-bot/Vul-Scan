@@ -1,13 +1,13 @@
 import { useEffect, useState } from 'react';
 
-import { expireSession, getAgentStatuses, getLogs, getScan, getWebSocketUrl, refreshSessionToken } from '../services/api';
+import { createAuthenticatedWebSocket, expireSession, getAgentStatuses, getLogs, getScan, refreshSessionToken } from '../services/api';
 import type { AgentStatus, AuditLog, ConnectionState, Finding, ScanStatus, TimelineEvent } from '../types';
 
 interface ScanTelemetry {
   connectionState: ConnectionState;
   scanStatus: ScanStatus | null;
-  progress: number;
-  requestCount: number;
+  progress: number | null;
+  requestCount: number | null;
   findings: Finding[];
   logs: AuditLog[];
   agents: AgentStatus[];
@@ -16,6 +16,24 @@ interface ScanTelemetry {
 }
 
 const terminalStatuses: ScanStatus[] = ['cancelled', 'complete', 'error'];
+const scanStatuses: ScanStatus[] = ['queued', 'running', 'cancelling', 'cancelled', 'complete', 'error'];
+
+function numericProgress(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.min(100, value));
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.max(0, Math.min(100, parsed));
+  }
+  return null;
+}
+
+function normalizeScanStatus(value: unknown): ScanStatus | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.toLowerCase();
+  if (normalized === 'completed') return 'complete';
+  if (normalized === 'failed') return 'error';
+  return scanStatuses.includes(normalized as ScanStatus) ? normalized as ScanStatus : null;
+}
 
 function timestamp(value?: string): string {
   const date = value ? new Date(value) : new Date();
@@ -46,8 +64,8 @@ function logsToEvents(logs: AuditLog[]): TimelineEvent[] {
 export function useScanTelemetry(scanId: number | null): ScanTelemetry {
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const [scanStatus, setScanStatus] = useState<ScanStatus | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [requestCount, setRequestCount] = useState(0);
+  const [progress, setProgress] = useState<number | null>(null);
+  const [requestCount, setRequestCount] = useState<number | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [agents, setAgents] = useState<AgentStatus[]>([]);
@@ -57,8 +75,8 @@ export function useScanTelemetry(scanId: number | null): ScanTelemetry {
   useEffect(() => {
     setConnectionState(scanId ? 'connecting' : 'idle');
     setScanStatus(null);
-    setProgress(0);
-    setRequestCount(0);
+    setProgress(null);
+    setRequestCount(null);
     setFindings([]);
     setLogs([]);
     setEvents([]);
@@ -70,9 +88,12 @@ export function useScanTelemetry(scanId: number | null): ScanTelemetry {
     let active = true;
     let reconnectTimer: number | undefined;
     let connectTimer: number | undefined;
+    let pollTimer: number | undefined;
+    let pollInFlight = false;
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 4;
     const CONNECT_TIMEOUT_MS = 5000;
+    const POLL_INTERVAL_MS = 2000;
     let sequence = 0;
     let latestStatus: ScanStatus | null = null;
     const seenEvents = new Set<string>();
@@ -89,16 +110,36 @@ export function useScanTelemetry(scanId: number | null): ScanTelemetry {
       for (const event of logsToEvents(nextLogs)) appendEvent(event);
     };
 
+    const applyFinding = (finding: Finding) => {
+      setFindings((current) => {
+        const id = Number(finding.id);
+        if (!Number.isFinite(id)) return [...current, finding];
+        const existingIndex = current.findIndex((item) => Number(item.id) === id);
+        if (existingIndex === -1) return [...current, finding];
+        const next = [...current];
+        next[existingIndex] = finding;
+        return next;
+      });
+    };
+
+    const stopPolling = () => {
+      if (pollTimer) {
+        window.clearInterval(pollTimer);
+        pollTimer = undefined;
+      }
+    };
+
     const refreshFallback = async () => {
       try {
         const [scan, nextLogs, nextAgents] = await Promise.all([getScan(scanId), getLogs(scanId), getAgentStatuses(scanId)]);
         latestStatus = scan.status;
         setScanStatus(scan.status);
-        setProgress(scan.progress);
+        setProgress((current) => Math.max(current ?? 0, scan.progress));
         setRequestCount(scan.request_count);
         setFindings(scan.findings);
         applyLogs(nextLogs);
         setAgents(nextAgents);
+        if (terminalStatuses.includes(scan.status)) stopPolling();
       } catch (fallbackError) {
         const is404 = typeof fallbackError === 'object' && fallbackError !== null && 'response' in fallbackError &&
           (fallbackError as { response?: { status?: number } }).response?.status === 404;
@@ -122,17 +163,30 @@ export function useScanTelemetry(scanId: number | null): ScanTelemetry {
 
       const payload = typeof frame.payload === 'object' && frame.payload !== null ? (frame.payload as Record<string, unknown>) : frame;
       const eventName = String(frame.event ?? frame.type ?? 'telemetry');
+      if (eventName === 'scan_complete') {
+        latestStatus = 'complete';
+        setScanStatus('complete');
+        setProgress(100);
+        stopPolling();
+      }
       if (typeof payload.error === 'string') {
         setError(payload.error);
         appendEvent({ timestamp: timestamp(), title: 'Realtime error', detail: payload.error, tone: 'red', agent: 'System' });
       }
-      if (typeof payload.status === 'string') {
-        latestStatus = payload.status as ScanStatus;
-        setScanStatus(payload.status as ScanStatus);
+      const nextStatus = normalizeScanStatus(payload.status);
+      if (nextStatus) {
+        latestStatus = nextStatus;
+        setScanStatus(nextStatus);
+        if (terminalStatuses.includes(nextStatus)) stopPolling();
       }
-      if (typeof payload.progress === 'number') setProgress(Math.max(0, Math.min(100, payload.progress)));
+      const nextProgress = numericProgress(payload.progress ?? payload.payload_progress);
+      if (nextProgress !== null) setProgress((current) => Math.max(current ?? 0, nextProgress));
       if (typeof payload.request_count === 'number') setRequestCount(payload.request_count);
-      if (Array.isArray(payload.findings)) setFindings(payload.findings as Finding[]);
+      if (Array.isArray(payload.findings)) {
+        setFindings(payload.findings as Finding[]);
+      } else if (typeof payload.finding === 'object' && payload.finding !== null) {
+        applyFinding(payload.finding as Finding);
+      }
       if (Array.isArray(payload.logs)) applyLogs(payload.logs as AuditLog[]);
 
       if (eventName !== 'snapshot' && eventName !== 'heartbeat') {
@@ -140,13 +194,15 @@ export function useScanTelemetry(scanId: number | null): ScanTelemetry {
         appendEvent({
           timestamp: timestamp(),
           title,
-          detail: typeof payload.phase === 'string'
-            ? payload.phase.replace(/_/g, ' ')
-            : typeof payload.details === 'string'
-              ? payload.details
-              : typeof payload.result === 'string'
-                ? payload.result
-                : undefined,
+          detail: typeof payload.message === 'string'
+            ? payload.message
+            : typeof payload.phase === 'string'
+              ? payload.phase.replace(/_/g, ' ')
+              : typeof payload.details === 'string'
+                ? payload.details
+                : typeof payload.result === 'string'
+                  ? payload.result
+                  : undefined,
           agent: typeof payload.agent_name === 'string' ? payload.agent_name : typeof payload.agent === 'string' ? payload.agent : 'System',
           tone: toneFor(`${eventName} ${String(payload.status ?? '')}`)
         });
@@ -173,7 +229,15 @@ export function useScanTelemetry(scanId: number | null): ScanTelemetry {
         return;
       }
       setConnectionState('connecting');
-      socket = new WebSocket(getWebSocketUrl(`/ws/scan/${scanId}`));
+      try {
+        socket = await createAuthenticatedWebSocket(`/ws/scan/${scanId}`, 'scan', scanId);
+      } catch {
+        setConnectionState('error');
+        setError('Realtime connection unavailable. Data updates via polling.');
+        reconnectAttempts += 1;
+        reconnectTimer = window.setTimeout(() => void connect(), Math.min(1000 * 2 ** reconnectAttempts, 8000));
+        return;
+      }
 
       // Timeout: if connection doesn't open within CONNECT_TIMEOUT_MS, treat as failed
       connectTimer = window.setTimeout(() => {
@@ -237,13 +301,24 @@ export function useScanTelemetry(scanId: number | null): ScanTelemetry {
       };
     };
 
+    const startPolling = () => {
+      stopPolling();
+      pollTimer = window.setInterval(() => {
+        if (!active || (latestStatus && terminalStatuses.includes(latestStatus)) || pollInFlight) return;
+        pollInFlight = true;
+        void refreshFallback().finally(() => { pollInFlight = false; });
+      }, POLL_INTERVAL_MS);
+    };
+
     void refreshFallback();
     void connect();
+    startPolling();
 
     return () => {
       active = false;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (connectTimer) window.clearTimeout(connectTimer);
+      stopPolling();
       socket?.close();
     };
   }, [scanId]);

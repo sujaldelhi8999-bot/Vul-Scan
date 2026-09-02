@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from app.agents import Agent
 from app.agents.ai_explainer import AIExplainerAgent
 from app.agents.ai_security_analyst import AISecurityAnalystAgent
@@ -44,7 +46,10 @@ from app.database import (
     get_previous_scan_for_target,
     get_scan_artifacts,
     list_applied_tunings,
+    safe_int,
     set_scan_artifacts,
+    update_evidence_finding,
+    update_finding,
     update_scan_progress,
     update_scan_status,
 )
@@ -54,9 +59,19 @@ from app.services.active_gate import ActiveTargetGate
 from app.services.adaptive_scan_planner import AdaptiveScanPlanner
 from app.services.ai_decision_maker import AIDecisionMaker
 from app.services.ai_exploitation import AIExploitationEngine
+from app.services.ai.exploit_generator import generate_poc_with_retry
+from app.services.ai.sandbox_executor import run_poc
+from app.services.attack_graph.builder import AttackGraphBuilder
+from app.services.attack_graph.sandbox_tester import SandboxTester
+from app.services.attack_graph.guide_generator import HackGuideGenerator
+from app.services.attack_graph.builder import AttackGraphBuilder, build_attack_graph_from_findings
+from app.services.attack_graph.validator import AttackPathValidator
 from app.services.authorization import TargetAuthorizationService, VerifiedTarget, canonicalize_target
 from app.services.execution import SafetyLimits
 from app.services.openrouter_client import call_openrouter
+from app.services.reporting.context_filter import apply_context_filter
+from app.services.reporting.report_generator import generate_report
+from app.security import redact_sensitive
 from app.services.tci import TargetComplexityIndex
 from app.websockets import scan_event_broker
 
@@ -80,6 +95,9 @@ class OrchestratorAgent(Agent):
     def __init__(self, limits: SafetyLimits | None = None) -> None:
         super().__init__("Orchestrator Agent")
         self.limits = limits or SafetyLimits.from_settings()
+        self._finding_lock = asyncio.Lock()
+        self._progress_lock = asyncio.Lock()
+        self._progress_by_scan: dict[int, int] = {}
 
     async def run(
         self,
@@ -91,6 +109,7 @@ class OrchestratorAgent(Agent):
         user_role: str = "user",
         authorization_context: dict[str, object] | None = None,
     ) -> dict[str, Any]:
+        settings = get_settings()
         target = canonicalize_target(scan_request.target_url)
         scan_request = scan_request.model_copy(update={"target_url": target.url})
         verified_target, authorization_context = await self.validate_execution(
@@ -116,7 +135,7 @@ class OrchestratorAgent(Agent):
         self.status = "active"
         await update_scan_status(scan_id, "running")
         await self.set_progress(scan_id, 2, "orchestration_started")
-        await self.log_action("started", f"Orchestrating {scan_request.mode} scan for {target.url}")
+        await self.log_action("started", f"Orchestrating {scan_request.mode}/{scan_request.profile or scan_request.scan_depth} scan for {target.url}")
         await self.publish(scan_id, "orchestrator", {"status": "running", "progress": 2})
 
         try:
@@ -133,7 +152,16 @@ class OrchestratorAgent(Agent):
             shadow_recon = ShadowReconAgent()
             scanner_event, shadow_event = await self.gather_agents(
                 self.run_agent("scanner", scanner.name, lambda: scanner.run(target.url, scan_id), scan_id),
-                self.run_agent("shadow_recon", shadow_recon.name, lambda: shadow_recon.run(target.url, scan_id), scan_id),
+                self.run_agent(
+                    "shadow_recon",
+                    shadow_recon.name,
+                    lambda: shadow_recon.run(target.url, scan_id, scan_depth=scan_request.scan_depth),
+                    scan_id,
+                ),
+                scan_id=scan_id,
+                phase="reconnaissance_running",
+                start_progress=2,
+                end_progress=30,
             )
             scanner_output = scanner_event["result"]
             shadow_output = shadow_event["result"]
@@ -143,6 +171,227 @@ class OrchestratorAgent(Agent):
                 shadow_recon_output=shadow_output,
             )
             await self.set_progress(scan_id, 30, "reconnaissance_complete")
+
+            # Phase 2: Vulnerability Detection
+            print(f"[DEBUG] scan_id={scan_id} – entering vulnerability phase")
+            await self.set_progress(scan_id, 35, "vulnerability_scanning_started")
+            print(f"[DEBUG] scan_id={scan_id} – set progress to 35")
+            vuln_profile = str(getattr(scan_request, "scan_depth", "quick") or "quick").lower()
+            if vuln_profile not in {"quick", "standard", "deep", "stealth"}:
+                vuln_profile = "quick"
+            # Stealth maps to deep-level modules with evasion enabled
+            effective_profile = "deep" if vuln_profile == "stealth" else vuln_profile
+            is_stealth = vuln_profile == "stealth" and settings.stealth_enabled
+            module_timeout = {"quick": 8.0, "standard": 20.0, "deep": 45.0, "stealth": 45.0}[vuln_profile]
+            from app.services.vuln_detectors import sqli_detector, xss_detector, lfi_detector, \
+                cmd_injection_detector, ssrf_detector, xxe_detector, idor_detector, \
+                csrf_detector, rate_limiting_detector, cors_detector, header_detector, \
+                tls_detector, business_logic_detector, file_upload_detector
+            from app.services.parameter_discoverer import discover_parameters
+            from app.services.js_analyzer import analyze_js_files
+            import bs4
+
+            # Get HTML for parameter and JS analysis – use stealth client when in stealth mode
+            print(f"[DEBUG] scan_id={scan_id} – fetching HTML for JS/param analysis (stealth={is_stealth})")
+            try:
+                if is_stealth:
+                    from app.evasion.probe import fetch_with_stealth
+                    _stealth_resp = await fetch_with_stealth(scan_request.target_url)
+                    html = _stealth_resp.text
+                else:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        resp = await client.get(scan_request.target_url)
+                        html = resp.text
+                print(f"[DEBUG] scan_id={scan_id} – HTML fetched ({len(html)} chars)")
+            except Exception as exc:
+                print(f"[DEBUG] scan_id={scan_id} – HTML fetch failed: {exc}")
+                html = ""
+
+            # Discover parameters and JS files
+            params_data = discover_parameters(html)
+            js_urls = [link.get('src') for link in bs4.BeautifulSoup(html, 'html.parser').find_all('script', src=True)]
+            js_findings = []
+            if vuln_profile != "quick":
+                js_limit = 5 if vuln_profile == "standard" else len(js_urls)
+                try:
+                    js_findings = await asyncio.wait_for(
+                        analyze_js_files(scan_request.target_url, js_urls[:js_limit]),
+                        timeout=module_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"[DEBUG] scan_id={scan_id} – JS analysis TIMED OUT after {module_timeout:g}s")
+            print(f"[DEBUG] scan_id={scan_id} – params={len(params_data.get('params',[]))}, js_urls={len(js_urls)}")
+
+            # Run vulnerability detectors with profile-specific scope and budgets.
+            all_params = params_data.get('params', [])
+            param_limit = {"quick": 3, "standard": 8, "deep": 12, "stealth": 12}[vuln_profile]
+            params = all_params[:param_limit]
+            print(f"[DEBUG] scan_id={scan_id} – profile={vuln_profile}, testing {len(params)}/{len(all_params)} params, timeout={module_timeout:g}s")
+            if effective_profile == "quick":
+                modules = [
+                    ("Security Headers", lambda: header_detector.scan_headers(scan_request.target_url, params, mode=effective_profile)),
+                    ("CORS", lambda: cors_detector.scan_cors(scan_request.target_url, params, mode=effective_profile)),
+                    ("TLS", lambda: tls_detector.scan_tls(scan_request.target_url, params, mode=effective_profile)),
+                    ("Basic SQLi", lambda: sqli_detector.scan_sqli(scan_request.target_url, params, mode=effective_profile, limit=2)),
+                    ("Basic XSS", lambda: xss_detector.scan_xss(scan_request.target_url, params, html=html, mode=effective_profile, limit=2)),
+                    ("Basic LFI", lambda: lfi_detector.scan_lfi(scan_request.target_url, params, mode=effective_profile, limit=2)),
+                ]
+            elif effective_profile == "standard":
+                modules = [
+                    ("SQL Injection", lambda: sqli_detector.scan_sqli(scan_request.target_url, params, mode=effective_profile)),
+                    ("XSS", lambda: xss_detector.scan_xss(scan_request.target_url, params, html=html, mode=effective_profile)),
+                    ("LFI", lambda: lfi_detector.scan_lfi(scan_request.target_url, params, mode=effective_profile)),
+                    ("Command Injection", lambda: cmd_injection_detector.scan_cmd(scan_request.target_url, params, mode=effective_profile)),
+                    ("SSRF", lambda: ssrf_detector.scan_ssrf(scan_request.target_url, params, mode=effective_profile)),
+                    ("IDOR", lambda: idor_detector.scan_idor(scan_request.target_url, params, mode=effective_profile)),
+                    ("CSRF", lambda: csrf_detector.scan_csrf(scan_request.target_url, params, mode=effective_profile)),
+                    ("Headers", lambda: header_detector.scan_headers(scan_request.target_url, params, mode=effective_profile)),
+                    ("CORS", lambda: cors_detector.scan_cors(scan_request.target_url, params, mode=effective_profile)),
+                    ("Rate Limiting", lambda: rate_limiting_detector.scan_rate_limiting(scan_request.target_url, params, mode=effective_profile)),
+                ]
+            else:
+                modules = [
+                    ("SQL Injection", lambda: sqli_detector.scan_sqli(scan_request.target_url, params, mode=effective_profile)),
+                    ("XSS", lambda: xss_detector.scan_xss(scan_request.target_url, params, html=html, mode=effective_profile)),
+                    ("LFI", lambda: lfi_detector.scan_lfi(scan_request.target_url, params, mode=effective_profile)),
+                    ("Command Injection", lambda: cmd_injection_detector.scan_cmd(scan_request.target_url, params, mode=effective_profile)),
+                    ("SSRF", lambda: ssrf_detector.scan_ssrf(scan_request.target_url, params, mode=effective_profile)),
+                    ("IDOR", lambda: idor_detector.scan_idor(scan_request.target_url, params, mode=effective_profile)),
+                    ("CSRF", lambda: csrf_detector.scan_csrf(scan_request.target_url, params, mode=effective_profile)),
+                    ("Headers", lambda: header_detector.scan_headers(scan_request.target_url, params, mode=effective_profile)),
+                    ("CORS", lambda: cors_detector.scan_cors(scan_request.target_url, params, mode=effective_profile)),
+                    ("Rate Limiting", lambda: rate_limiting_detector.scan_rate_limiting(scan_request.target_url, params, mode=effective_profile)),
+                    ("XXE", lambda: xxe_detector.scan_xxe(scan_request.target_url, mode=effective_profile)),
+                    ("Business Logic", lambda: business_logic_detector.scan_business_logic(scan_request.target_url, params, html=html, mode=effective_profile)),
+                    ("File Upload", lambda: file_upload_detector.scan_file_upload(scan_request.target_url, params, html=html, mode=effective_profile)),
+                ]
+            total = len(modules)
+            findings = []
+            print(f"[DEBUG] scan_id={scan_id} – starting {total} {vuln_profile} vulnerability modules (stealth={is_stealth})")
+            for idx, (name, func) in enumerate(modules):
+                # Stealth mode: add random delays between modules to mimic human browsing
+                if is_stealth:
+                    from app.core.http_client import stealth_delay
+                    await stealth_delay(settings.evasion_delay_min, settings.evasion_delay_max)
+                progress = 35 + int((idx / total) * 30)  # 35% → 65%
+                print(f"[DEBUG] scan_id={scan_id} – [{idx+1}/{total}] {name} at {progress}%")
+                await self.set_progress(scan_id, progress, f"vuln_{name.lower().replace(' ', '_')}_running")
+                print(f"[DEBUG] scan_id={scan_id} – progress {progress}% published for {name}")
+                try:
+                    result = await asyncio.wait_for(
+                        func(),
+                        timeout=module_timeout,
+                    )
+                    if isinstance(result, list):
+                        findings.extend(result)
+                        print(f"[DEBUG] scan_id={scan_id} – {name} returned {len(result)} findings")
+                    else:
+                        findings.append(result)
+                        print(f"[DEBUG] scan_id={scan_id} – {name} returned 1 finding")
+                except asyncio.TimeoutError:
+                    print(f"[DEBUG] scan_id={scan_id} – {name} TIMED OUT after {module_timeout:g}s")
+                    await self.set_progress(scan_id, progress, f"vuln_{name.lower().replace(' ', '_')}_timed_out")
+                except Exception as e:
+                    print(f"[DEBUG] scan_id={scan_id} – {name} ERROR: {type(e).__name__}: {str(e)[:200]}")
+                    await self.set_progress(scan_id, progress, f"vuln_{name.lower().replace(' ', '_')}_error")
+            print(f"[DEBUG] scan_id={scan_id} – all modules done, setting progress to 65")
+            await self.set_progress(scan_id, 65, "vulnerability_scanning_complete")
+
+            # Add JS analysis findings
+            for jf in js_findings:
+                findings.append({
+                    "type": "JS Info Leak",
+                    "severity": "LOW",
+                    "detail": jf,
+                    "confidence": 50
+                })
+
+            # Apply context-aware filtering
+            tech_stack = scanner_output.get("tech_stack", {})
+            filtered_findings = apply_context_filter(
+                findings, tech_stack, params_data['params'],
+                scanner_output.get("subdomains", [])
+            )
+
+            # Phase 3: AI Verification intensity follows the scan profile.
+            await self.set_progress(scan_id, 70, "ai_verification_started" if effective_profile != "quick" else "ai_verification_skipped")
+            verified_findings = []
+            verification_severities = {
+                "quick": set(),
+                "standard": {"CRITICAL"},
+                "deep": {"CRITICAL", "HIGH"},
+            }[effective_profile]
+            verification_retries = {"standard": 1, "deep": 3}.get(effective_profile, 0)
+            for finding in filtered_findings:
+                severity = str(finding.get("severity", "")).upper()
+                if effective_profile == "quick":
+                    finding["verified"] = False
+                    finding["confidence"] = 60
+                elif severity in verification_severities:
+                    try:
+                        poc_script = await generate_poc_with_retry(finding, max_retries=verification_retries)
+                        if poc_script:
+                            verdict = await run_poc(poc_script)
+                            finding["verified"] = verdict["success"]
+                            finding["confidence"] = 95 if verdict["success"] else 50
+                            finding["poc"] = poc_script if verdict["success"] else None
+                    except Exception as e:
+                        finding["verified"] = False
+                        finding["confidence"] = 30
+                else:
+                    finding["verified"] = False
+                verified_findings.append(finding)
+            # Phase 4: Attack Graph Generation
+            await self.set_progress(scan_id, 85, "attack_graph_generation")
+
+            # Build attack graph from verified findings
+            attack_graph_builder = AttackGraphBuilder()
+            for f in verified_findings:
+                finding = type('Finding', (), {
+                    'id': f.get('id', 0),
+                    'type': f.get('type', ''),
+                    'severity': f.get('severity', ''),
+                    'target': f.get('target', ''),
+                    'param': f.get('param', ''),
+                    'payload': f.get('payload', ''),
+                    'evidence': f.get('evidence', '')
+                })()
+                attack_graph_builder.add_finding(finding)
+
+            graph = attack_graph_builder.build()
+
+            # Find attack paths
+            all_paths = attack_graph_builder.find_all_paths()
+
+            # Validate attack paths
+            validator = AttackPathValidator(
+                lambda finding: any(
+                    marker in (finding.get('evidence') or '').lower()
+                    for marker in ['vuln_true', 'confirmed', 'verified']
+                )
+            )
+
+            validated_paths = await validator.validate_all_paths(all_paths)
+
+            # Store attack graph and paths in artifacts
+            await set_scan_artifacts(
+                scan_id,
+                attack_graph=graph,
+                attack_paths=all_paths,
+                path_validations=validated_paths,
+            )
+
+            await self.set_progress(scan_id, 90, "attack_analysis_complete")
+
+
+            # Store findings in database
+            await set_scan_artifacts(
+                scan_id,
+                vuln_findings=filtered_findings,
+                verified_findings=verified_findings,
+            )
+
+            await self.set_progress(scan_id, 80, "verification_complete")
 
             complexity = TargetComplexityIndex().analyze_recon(scanner_output)
             await set_scan_artifacts(scan_id, tci_output=complexity)
@@ -197,18 +446,27 @@ class OrchestratorAgent(Agent):
             analyzer = AnalyzerAgent()
             cve_matcher = CVEMatcherAgent()
             browser_security = BrowserSecurityAgent(limits=self.limits)
+            analysis_timeout = max(1.0, float(getattr(get_settings(), "analysis_module_timeout", 20.0)))
             analysis_tasks = [
                 self.run_agent(
                     "analyzer",
                     analyzer.name,
                     lambda: analyzer.run(target.url, scan_id, scanner_output),
                     scan_id,
+                    max_retries=0,
+                    timeout=analysis_timeout,
+                    timeout_result={},
+                    live_findings_target=target.url,
                 ),
                 self.run_agent(
                     "cve_matcher",
                     cve_matcher.name,
                     lambda: cve_matcher.run(scanner_output.get("tech_stack", {}), scan_id),
                     scan_id,
+                    max_retries=0,
+                    timeout=analysis_timeout,
+                    timeout_result={"cve_matches": [], "provider_errors": [{"provider": "NVD", "error_type": "DEPENDENCY_UNAVAILABLE", "message": f"CVE matcher timed out after {analysis_timeout:g}s"}]},
+                    live_findings_target=target.url,
                 ),
                 self.run_agent(
                     "browser_security",
@@ -220,6 +478,10 @@ class OrchestratorAgent(Agent):
                         authorization_context=authorization_context,
                     ),
                     scan_id,
+                    max_retries=0,
+                    timeout=analysis_timeout,
+                    timeout_result={},
+                    live_findings_target=target.url,
                 ),
             ]
             assessment_agents = [
@@ -238,8 +500,12 @@ class OrchestratorAgent(Agent):
                     self.run_agent(
                         event_name,
                         agent.name,
-                        lambda: agent.run(target.url, scan_id, scanner_output, shadow_output),
+                        lambda agent=agent: agent.run(target.url, scan_id, scanner_output, shadow_output),
                         scan_id,
+                        max_retries=0,
+                        timeout=analysis_timeout,
+                        timeout_result={},
+                        live_findings_target=target.url,
                     )
                 )
 
@@ -259,7 +525,7 @@ class OrchestratorAgent(Agent):
                     "selected_modules": ai_decision or scan_request.selected_tests or planned_modules or [],
                     "selected_tests": scan_request.selected_tests,
                     "business_logic_tests": business_logic_tests,
-                    "workflow_rules": {"business_logic_tests": business_logic_tests},
+                    "workflow_rules": {"business_logic_tests": business_logic_tests, "confidence_profile": scan_request.confidence_profile},
                     "user_id": user_id,
                     "authorization_id": authorization_context.get("authorization_id"),
                     "authorization_context": authorization_context,
@@ -270,10 +536,18 @@ class OrchestratorAgent(Agent):
                         sandbox.name,
                         lambda: sandbox.run_active_scan(active_payload, scan_id),
                         scan_id,
+                        max_retries=0,
+                        live_findings_target=target.url,
                     )
                 )
 
-            analysis_events = await self.gather_agents(*analysis_tasks)
+            analysis_events = await self.gather_agents(
+                *analysis_tasks,
+                scan_id=scan_id,
+                phase="analysis_running",
+                start_progress=30,
+                end_progress=65,
+            )
             active_result = next(
                 (
                     event["result"]
@@ -320,7 +594,7 @@ class OrchestratorAgent(Agent):
                     },
                 )
             request_count = max(
-                (int(event["result"].get("request_count", 0)) for event in analysis_events),
+                (count for event in analysis_events if (count := safe_int(event["result"].get("request_count"))) is not None),
                 default=0,
             )
             sandbox_id = next(
@@ -348,19 +622,29 @@ class OrchestratorAgent(Agent):
                     asyncio.create_task(alert_notifier.send_critical_alert(cf, target.url, scan_id))
 
             ai_explainer = AIExplainerAgent()
-            ai_event = await self.run_agent(
-                "ai_explainer",
-                ai_explainer.name,
-                lambda: ai_explainer.run(findings, scan_id),
-                scan_id,
-            )
-            enriched_findings = ai_event["result"].get("findings", findings)
+            try:
+                ai_event = await self.run_agent(
+                    "ai_explainer",
+                    ai_explainer.name,
+                    lambda: ai_explainer.run(findings, scan_id),
+                    scan_id,
+                    max_retries=0,
+                    timeout=20.0,
+                )
+                enriched_findings = ai_event["result"].get("findings", findings)
+            except asyncio.TimeoutError:
+                await self.log_action("ai_explainer_timeout", "AI explainer timed out; continuing with deterministic findings")
+                await self.publish(scan_id, "ai_explainer_timeout", {"status": "timeout", "message": "AI explainer timed out; using fallback findings", "progress": 78})
+                enriched_findings = findings
+            except Exception as exc:
+                await self.log_action("ai_explainer_error", str(exc)[:2000])
+                await self.publish(scan_id, "ai_explainer_error", {"status": "error", "message": "AI explainer failed; using fallback findings", "error": str(exc)[:500], "progress": 78})
+                enriched_findings = findings
             await self.set_progress(scan_id, 78, "explanations_complete", request_count=request_count)
 
             persisted_findings = await self.persist_findings(scan_id, enriched_findings, target.url)
             await self.set_progress(scan_id, 86, "findings_persisted", request_count=request_count)
 
-            settings = get_settings()
             exploitation_requested = (
                 scan_request.enable_exploitation and scan_request.mode == "pentest"
             )
@@ -415,13 +699,24 @@ class OrchestratorAgent(Agent):
                 )
 
             fixer = FixerAgent()
-            fixer_event = await self.run_agent(
-                "fixer",
-                fixer.name,
-                lambda: fixer.run(persisted_findings, scan_id),
-                scan_id,
-            )
-            markdown_report = str(fixer_event["result"].get("markdown_report", ""))
+            try:
+                fixer_event = await self.run_agent(
+                    "fixer",
+                    fixer.name,
+                    lambda: fixer.run(persisted_findings, scan_id),
+                    scan_id,
+                    max_retries=0,
+                    timeout=20.0,
+                )
+                markdown_report = str(fixer_event["result"].get("markdown_report", ""))
+            except asyncio.TimeoutError:
+                await self.log_action("fixer_timeout", "Fixer report generation timed out; continuing with fallback report")
+                await self.publish(scan_id, "fixer_timeout", {"status": "timeout", "message": "Report generation timed out; using fallback report", "progress": 93})
+                markdown_report = f"# PhantomScan Report\n\nScan completed with {len(persisted_findings)} findings. AI report generation timed out."
+            except Exception as exc:
+                await self.log_action("fixer_error", str(exc)[:2000])
+                await self.publish(scan_id, "fixer_error", {"status": "error", "message": "Report generation failed; using fallback report", "error": str(exc)[:500], "progress": 93})
+                markdown_report = f"# PhantomScan Report\n\nScan completed with {len(persisted_findings)} findings. Report generation failed."
             if active_result and active_result.get("final_report"):
                 markdown_report = f"{markdown_report}\n\n{active_result['final_report']}" if markdown_report else str(active_result["final_report"])
             if browser_result:
@@ -453,26 +748,39 @@ class OrchestratorAgent(Agent):
             for f in persisted_findings:
                 s = str(f.get("severity", "INFO")).upper()
                 sev_counts[s] = sev_counts.get(s, 0) + 1
-            consultation = await call_openrouter(
-                json.dumps({
-                    "target": target.url,
-                    "total_findings": len(persisted_findings),
-                    "severity_breakdown": sev_counts,
-                    "top_findings": [
-                        {"title": f.get("title"), "severity": f.get("severity"), "category": f.get("category"), "endpoint": f.get("endpoint")}
-                        for f in persisted_findings[:20]
-                    ],
-                }, default=str),
-                system_prompt=(
-                    "You are PhantomScan's senior security consultant. Analyze the scan results "
-                    "and provide: 1) Risk prioritization (what to fix first and why), "
-                    "2) Attack chain analysis (how vulnerabilities chain together), "
-                    "3) Executive summary (2-3 sentences for leadership)."
-                ),
-                max_tokens=1500,
-                scan_id=scan_id,
-                json_response=True,
-            )
+            consultation = None
+            try:
+                consultation = await asyncio.wait_for(
+                    call_openrouter(
+                        json.dumps({
+                            "target": target.url,
+                            "total_findings": len(persisted_findings),
+                            "severity_breakdown": sev_counts,
+                            "top_findings": [
+                                {"title": f.get("title"), "severity": f.get("severity"), "category": f.get("category"), "endpoint": f.get("endpoint")}
+                                for f in persisted_findings[:20]
+                            ],
+                        }, default=str),
+                        system_prompt=(
+                            "You are PhantomScan's senior security consultant. Analyze the scan results "
+                            "and provide: 1) Risk prioritization (what to fix first and why), "
+                            "2) Attack chain analysis (how vulnerabilities chain together), "
+                            "3) Executive summary (2-3 sentences for leadership)."
+                        ),
+                        max_tokens=1500,
+                        scan_id=scan_id,
+                        json_response=True,
+                        timeout=15.0,
+                        retry_limit=1,
+                    ),
+                    timeout=16.0,
+                )
+            except asyncio.TimeoutError:
+                await self.log_action("ai_consultation_timeout", "AI consultation timed out; continuing without consultation")
+                await self.publish(scan_id, "ai_consultation_timeout", {"status": "timeout", "message": "AI consultation timed out; deterministic report remains available", "progress": 95})
+            except Exception as exc:
+                await self.log_action("ai_consultation_error", str(exc)[:2000])
+                await self.publish(scan_id, "ai_consultation_error", {"status": "error", "message": "AI consultation failed; deterministic report remains available", "error": str(exc)[:500], "progress": 95})
             ai_consultation = None
             if consultation:
                 try:
@@ -481,7 +789,6 @@ class OrchestratorAgent(Agent):
                     ai_consultation = {"raw": consultation}
                 await set_scan_artifacts(scan_id, ai_consultation=ai_consultation)
                 await self.publish(scan_id, "ai_consultation", {"summary": ai_consultation})
-
             sqli_exploitation_results = [
                 f.get("exploitation_result") for f in persisted_findings
                 if f.get("exploited") and f.get("exploitation_result")
@@ -526,6 +833,10 @@ class OrchestratorAgent(Agent):
             await self.publish(scan_id, "scan_complete", {"status": "complete", "progress": 100})
             return summary
         except asyncio.CancelledError:
+            self.status = "cancelled"
+            await update_scan_status(scan_id, "cancelled")
+            await self.log_action("cancelled", "Scan was cancelled")
+            await self.publish(scan_id, "scan_cancelled", {"status": "cancelled", "progress": 0})
             raise
         except Exception as exc:
             traceback.print_exc()
@@ -625,13 +936,24 @@ class OrchestratorAgent(Agent):
 
             await self.set_progress(scan_id, 90, "reports_generation")
             fixer = FixerAgent()
-            fixer_event = await self.run_agent(
-                "fixer",
-                fixer.name,
-                lambda: fixer.run(persisted_findings, scan_id),
-                scan_id,
-            )
-            markdown_report = str(fixer_event["result"].get("markdown_report", ""))
+            try:
+                fixer_event = await self.run_agent(
+                    "fixer",
+                    fixer.name,
+                    lambda: fixer.run(persisted_findings, scan_id),
+                    scan_id,
+                    max_retries=0,
+                    timeout=20.0,
+                )
+                markdown_report = str(fixer_event["result"].get("markdown_report", ""))
+            except asyncio.TimeoutError:
+                await self.log_action("fixer_timeout", "Fixer report generation timed out; continuing with fallback report")
+                await self.publish(scan_id, "fixer_timeout", {"status": "timeout", "message": "Report generation timed out; using fallback report", "progress": 93})
+                markdown_report = f"# PhantomScan Report\n\nScan completed with {len(persisted_findings)} findings. AI report generation timed out."
+            except Exception as exc:
+                await self.log_action("fixer_error", str(exc)[:2000])
+                await self.publish(scan_id, "fixer_error", {"status": "error", "message": "Report generation failed; using fallback report", "error": str(exc)[:500], "progress": 93})
+                markdown_report = f"# PhantomScan Report\n\nScan completed with {len(persisted_findings)} findings. Report generation failed."
             await set_scan_artifacts(scan_id, markdown_report=markdown_report)
 
             await self.set_progress(scan_id, 93, "ai_analysis")
@@ -688,6 +1010,11 @@ class OrchestratorAgent(Agent):
             }
 
         except asyncio.CancelledError:
+            self.status = "cancelled"
+            await self._cleanup_uploaded_sources(scan_request)
+            await update_scan_status(scan_id, "cancelled")
+            await self.log_action("cancelled", "Multi-source scan was cancelled")
+            await self.publish(scan_id, "scan_cancelled", {"status": "cancelled", "progress": 0})
             raise
         except Exception as exc:
             traceback.print_exc()
@@ -786,11 +1113,14 @@ class OrchestratorAgent(Agent):
                 "open_ports": scanner_output.get("open_ports") or [],
             }
             decision_maker = AIDecisionMaker()
-            recommended = await decision_maker.recommend_modules(
-                target_url,
-                recon_context,
-                scan_id=scan_id,
-                manual_selection=selected_tests or None,
+            recommended = await asyncio.wait_for(
+                decision_maker.recommend_modules(
+                    target_url,
+                    recon_context,
+                    scan_id=scan_id,
+                    manual_selection=selected_tests or None,
+                ),
+                timeout=20.0,
             )
             if selected_tests and recommended:
                 source = "merged"
@@ -813,6 +1143,18 @@ class OrchestratorAgent(Agent):
                 f"{source}: selected {len(recommended)} modules: {recommended[:12]}",
             )
             return recommended
+        except asyncio.TimeoutError:
+            logger.warning("AI decision maker timed out for %s", target_url)
+            try:
+                await self.log_action("ai_decision_timeout", "AI decision maker timed out; using selected/default modules")
+                await self.publish(
+                    scan_id,
+                    "ai_decision_timeout",
+                    {"status": "timeout", "source": "fallback", "selected_modules": selected_tests, "module_count": len(selected_tests)},
+                )
+            except Exception as e:
+                logger.debug("Failed to log AI decision timeout: %s", e)
+            return selected_tests or None
         except Exception as exc:
             logger.exception("AI decision maker failed for %s", target_url)
             try:
@@ -897,8 +1239,9 @@ class OrchestratorAgent(Agent):
             await self.publish(scan_id, "ai_exploitation_started", {
                 "message": "AI exploitation engine started: generating and validating PoCs...",
             })
-            result = await engine.run_for_scan(
-                target_url, scan_id, findings, sandbox_id=sandbox_id
+            result = await asyncio.wait_for(
+                engine.run_for_scan(target_url, scan_id, findings, sandbox_id=sandbox_id),
+                timeout=30.0,
             )
             await self.publish(scan_id, "ai_exploitation_result", {
                 "exploitation_results": result.get("exploitation_results", []),
@@ -907,6 +1250,19 @@ class OrchestratorAgent(Agent):
             })
             await self.log_action("ai_exploitation", result.get("summary", ""))
             return result
+        except asyncio.TimeoutError:
+            logger.warning("AI exploitation timed out for %s", target_url)
+            await self.publish(scan_id, "ai_exploitation_timeout", {"status": "timeout", "message": "AI exploitation timed out; continuing without AI exploitation results"})
+            try:
+                await self.log_action("ai_exploitation_timeout", "AI exploitation timed out; continuing without AI exploitation results")
+            except Exception as e:
+                logger.debug("Failed to log AI exploitation timeout: %s", e)
+            return {
+                "status": "timeout",
+                "exploitation_results": [],
+                "summary": "AI exploitation timed out; deterministic scan results remain available.",
+                "ai_available": False,
+            }
         except Exception as exc:
             logger.exception("AI exploitation failed for %s", target_url)
             try:
@@ -967,6 +1323,8 @@ class OrchestratorAgent(Agent):
                     logs=logs,
                 ),
                 scan_id,
+                max_retries=0,
+                timeout=20.0,
             )
             return event["result"]
         except asyncio.CancelledError:
@@ -982,18 +1340,55 @@ class OrchestratorAgent(Agent):
             )
             return {**fallback, "error": str(exc)[:500]}
 
-    async def gather_agents(self, *operations: Awaitable[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def gather_agents(
+        self,
+        *operations: Awaitable[dict[str, Any]],
+        scan_id: int | None = None,
+        phase: str = "agents_running",
+        start_progress: int | None = None,
+        end_progress: int | None = None,
+    ) -> list[dict[str, Any]]:
         tasks = [asyncio.create_task(operation) for operation in operations]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        # Convert any exceptions to error results so callers can proceed
-        cleaned: list[dict[str, Any]] = []
-        for i, r in enumerate(results):
-            if isinstance(r, BaseException):
-                logger.error("Agent task %d raised: %s", i, r)
-                cleaned.append({"error": str(r)[:500], "result": {}})
-            else:
-                cleaned.append(r)
-        return cleaned
+        results: list[dict[str, Any] | None] = [None] * len(tasks)
+        task_indexes = {task: i for i, task in enumerate(tasks)}
+        completed = 0
+
+        while task_indexes:
+            done, _ = await asyncio.wait(task_indexes.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                index = task_indexes.pop(task)
+                completed += 1
+                try:
+                    result = task.result()
+                except BaseException as exc:
+                    logger.error("Agent task %d raised: %s", index, exc)
+                    result = {"error": str(exc)[:500], "result": {}}
+                results[index] = result
+
+                if scan_id is not None and start_progress is not None and end_progress is not None and tasks:
+                    progress = start_progress + int((completed / len(tasks)) * (end_progress - start_progress))
+                    agent_name = str(result.get("agent_name") or result.get("agent") or f"agent {index + 1}")
+                    status_value = str(result.get("status") or "complete")
+                    bounded_progress = min(end_progress, progress)
+                    effective_progress = await self.set_progress(
+                        scan_id,
+                        bounded_progress,
+                        phase,
+                        publish_event=False,
+                    )
+                    payload = {
+                        "phase": phase,
+                        "status": "running",
+                        "progress": effective_progress,
+                        "completed_agents": completed,
+                        "total_agents": len(tasks),
+                        "agent_name": agent_name,
+                        "message": f"{agent_name} {status_value}; {completed}/{len(tasks)} analysis agents complete",
+                    }
+                    await self.publish(scan_id, "scan_progress", payload)
+                    await self.publish(scan_id, phase, payload)
+
+        return [result or {"error": "Agent did not return a result", "result": {}} for result in results]
 
     async def validate_execution(
         self,
@@ -1041,6 +1436,8 @@ class OrchestratorAgent(Agent):
         *,
         max_retries: int = 1,
         timeout: float | None = None,
+        timeout_result: dict[str, Any] | None = None,
+        live_findings_target: str | None = None,
     ) -> dict[str, Any]:
         await self.publish(
             scan_id,
@@ -1063,6 +1460,14 @@ class OrchestratorAgent(Agent):
                     "attempt": attempt + 1,
                 }
                 await self.publish(scan_id, event_name, event)
+                if live_findings_target is not None:
+                    live_findings = self.collect_findings([event], live_findings_target)
+                    if live_findings:
+                        await self.persist_findings(
+                            scan_id,
+                            self._apply_ml_prioritization(live_findings),
+                            live_findings_target,
+                        )
                 return event
             except asyncio.CancelledError:
                 raise
@@ -1074,6 +1479,14 @@ class OrchestratorAgent(Agent):
                     event_name,
                     {"agent": event_name, "agent_name": agent_name, "status": "timeout", "attempt": attempt + 1},
                 )
+                if attempt >= max_retries and timeout_result is not None:
+                    return {
+                        "agent": event_name,
+                        "agent_name": agent_name,
+                        "status": "timeout",
+                        "result": timeout_result,
+                        "attempt": attempt + 1,
+                    }
             except Exception as exc:
                 last_exc = exc
                 traceback.print_exc()
@@ -1123,10 +1536,7 @@ class OrchestratorAgent(Agent):
         severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
         for finding in findings:
-            title = str(finding.get("title", "")).lower().strip()
-            category = str(finding.get("category", "")).lower().strip()
-            endpoint = str(finding.get("endpoint", "")).lower().strip()
-            dedup_key = f"{title}|{category}|{endpoint}"
+            dedup_key = self._runtime_dedup_key(finding)
 
             if dedup_key in seen:
                 existing = seen[dedup_key]
@@ -1134,15 +1544,18 @@ class OrchestratorAgent(Agent):
                 new_sev = severity_order.get(str(finding.get("severity", "INFO")).upper(), 4)
 
                 if new_sev < existing_sev:
+                    finding["corroborating_agents"] = list(existing.get("corroborating_agents") or [])
                     seen[dedup_key] = finding
                     dedup_idx = None
                     for i, d in enumerate(deduplicated):
-                        d_key = f"{str(d.get('title', '')).lower().strip()}|{str(d.get('category', '')).lower().strip()}|{str(d.get('endpoint', '')).lower().strip()}"
+                        d_key = self._runtime_dedup_key(d)
                         if d_key == dedup_key:
                             dedup_idx = i
                             break
                     if dedup_idx is not None:
                         deduplicated[dedup_idx] = finding
+
+                    existing = finding
 
                 if existing.get("agent") != finding.get("agent"):
                     existing_agents = existing.get("corroborating_agents", [])
@@ -1157,6 +1570,20 @@ class OrchestratorAgent(Agent):
 
         return deduplicated
 
+    @staticmethod
+    def _runtime_dedup_key(finding: dict[str, Any]) -> str:
+        fields = (
+            "title",
+            "category",
+            "endpoint",
+            "parameter",
+            "module",
+            "file_path",
+            "line_number",
+            "cve_id",
+        )
+        return "|".join(str(finding.get(field, "")).lower().strip() for field in fields)
+
     def cve_matches_to_findings(
         self,
         cve_matches: list[dict[str, Any]],
@@ -1166,7 +1593,7 @@ class OrchestratorAgent(Agent):
         for match in cve_matches:
             score = match.get("cvss_score")
             cve_id = match.get("cve_id") or "Unknown CVE"
-            technology = match.get("technology") or "detected technology"
+            technology = match.get("affected_component") or match.get("technology") or "detected technology"
             cwe_list = match.get("cwe", [])
             version_affected = match.get("version_affected")
             cwe_str = ", ".join(cwe_list) if cwe_list else ""
@@ -1241,38 +1668,131 @@ class OrchestratorAgent(Agent):
         findings: list[dict[str, Any]],
         target_url: str,
     ) -> list[dict[str, Any]]:
-        existing = await get_findings(scan_id)
-        seen: set[tuple[Any, ...]] = set()
-        for row in existing:
-            try:
-                seen.add(
-                    self.finding_key(
+        async with self._finding_lock:
+            existing = await get_findings(scan_id)
+            seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+            for row in existing:
+                try:
+                    key = self.finding_key(
                         FindingCreate(**{name: row.get(name) for name in FindingCreate.model_fields})
                     )
+                except Exception:
+                    # DB rows may predate optional FindingCreate fields (exploited, sources,
+                    # patch, ...) — build the key from present non-None values only.
+                    data = {name: row.get(name) for name in FindingCreate.model_fields if row.get(name) is not None}
+                    if not data:
+                        continue
+                    key = self.finding_key(FindingCreate(**data))
+                seen[key] = row
+            for finding in findings:
+                try:
+                    normalized = self.normalize_finding(finding, target_url)
+                except ValueError as exc:
+                    await add_audit_log(scan_id, self.name, "finding_skipped", str(exc)[:2000])
+                    continue
+                key = self.finding_key(normalized)
+                existing_row = seen.get(key)
+                if existing_row is not None:
+                    await self.update_existing_finding(scan_id, existing_row, normalized)
+                    continue
+                finding_id = await create_finding(scan_id, normalized)
+                evidence_ids = list(finding.get("_evidence_ids") or [])
+                if finding.get("_evidence_id") and finding.get("_evidence_id") not in evidence_ids:
+                    evidence_ids.append(finding.get("_evidence_id"))
+                for evidence_id in evidence_ids:
+                    try:
+                        await update_evidence_finding(int(evidence_id), finding_id)
+                    except (TypeError, ValueError):
+                        continue
+                current_findings = [self.live_finding_payload(row) for row in await get_findings(scan_id)]
+                created_finding = next((row for row in current_findings if int(row.get("id") or 0) == finding_id), None)
+                finding_message = (
+                    f"Verified finding: {normalized.title}"
+                    if created_finding and created_finding.get("verified")
+                    else f"Finding detected: {normalized.title}"
                 )
-            except Exception:
-                # DB rows may predate optional FindingCreate fields (exploited, sources,
-                # patch, ...) — build the key from present non-None values only.
-                data = {name: row.get(name) for name in FindingCreate.model_fields if row.get(name) is not None}
-                if data:
-                    seen.add(self.finding_key(FindingCreate(**data)))
-        for finding in findings:
-            try:
-                normalized = self.normalize_finding(finding, target_url)
-            except ValueError as exc:
-                await add_audit_log(scan_id, self.name, "finding_skipped", str(exc)[:2000])
+                await self.publish(
+                    scan_id,
+                    "finding_created",
+                    {
+                        "finding_id": finding_id,
+                        "title": normalized.title,
+                        "severity": normalized.severity,
+                        "status": "running",
+                        "message": finding_message,
+                        "finding": created_finding,
+                        "findings": current_findings,
+                    },
+                )
+                if created_finding is not None:
+                    seen[key] = created_finding
+            return await get_findings(scan_id)
+
+    async def update_existing_finding(
+        self,
+        scan_id: int,
+        existing: dict[str, Any],
+        normalized: FindingCreate,
+    ) -> None:
+        finding_id = int(existing.get("id") or 0)
+        if finding_id <= 0:
+            return
+        data = normalized.model_dump(mode="json")
+        updatable = {
+            "title", "category", "severity", "confidence", "target", "endpoint",
+            "evidence", "impact", "recommendation", "verification", "agent",
+            "cve_id", "cvss_score", "cwe", "version_affected", "file_path",
+            "line_number", "code_snippet", "fix_recommendation", "parameter",
+            "module", "recommended_fix", "verification_status", "request_id",
+            "confidence_score", "confidence_label", "reproduction_command",
+            "request_response_diff", "verification_hash", "verification_method",
+            "verification_stage", "verification_result", "source_correlation",
+        }
+        updates: dict[str, Any] = {}
+        for name in updatable:
+            value = data.get(name)
+            if value in (None, ""):
                 continue
-            key = self.finding_key(normalized)
-            if key in seen:
-                continue
-            finding_id = await create_finding(scan_id, normalized)
-            await self.publish(
-                scan_id,
-                "finding_created",
-                {"finding_id": finding_id, "title": normalized.title, "severity": normalized.severity},
-            )
-            seen.add(key)
-        return await get_findings(scan_id)
+            if existing.get(name) != value:
+                updates[name] = value
+        if not updates:
+            return
+        await update_finding(finding_id, **updates)
+        current_findings = [self.live_finding_payload(row) for row in await get_findings(scan_id)]
+        updated_finding = next((row for row in current_findings if int(row.get("id") or 0) == finding_id), None)
+        await self.publish(
+            scan_id,
+            "finding_updated",
+            {
+                "finding_id": finding_id,
+                "title": data.get("title"),
+                "severity": data.get("severity"),
+                "status": "running",
+                "message": f"Finding updated: {data.get('title')}",
+                "finding": updated_finding,
+                "findings": current_findings,
+            },
+        )
+
+    @staticmethod
+    def live_finding_payload(finding: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(finding)
+        confidence = str(payload.get("confidence") or "").upper()
+        verification_status = str(payload.get("verification_status") or "").upper()
+        verified = confidence == "CONFIRMED" or verification_status == "ISSUE_STILL_PRESENT"
+        payload["verified"] = verified
+        score = payload.get("confidence_score")
+        try:
+            payload["confidence_percent"] = round(float(score) * 100) if score is not None else {
+                "CONFIRMED": 100,
+                "HIGH": 85,
+                "MEDIUM": 65,
+                "LOW": 40,
+                "POTENTIAL": 25,
+            }.get(confidence, 0)
+        except (TypeError, ValueError):
+            payload["confidence_percent"] = 0
+        return payload
 
     @staticmethod
     def normalize_finding(finding: dict[str, Any], target_url: str) -> FindingCreate:
@@ -1346,7 +1866,7 @@ class OrchestratorAgent(Agent):
         if not evidence:
             evidence = first_text("advisory_url")
 
-        code_snippet = first_text("code_snippet", "matched_text", "matched_content", "context")[:12000] or None
+        code_snippet = redact_sensitive(first_text("code_snippet", "matched_text", "matched_content", "context")[:12000]) or None
         recommendation = first_text("recommendation", "fix_recommendation", "fix", "remediation")
         if not recommendation:
             fixed_version = first_text("fixed_version")
@@ -1386,7 +1906,7 @@ class OrchestratorAgent(Agent):
             confidence=confidence,
             target=first_text("target", "target_url", default=target_url)[:2048],
             endpoint=first_text("endpoint", "url", "path", "file_path", default=target_url)[:2048],
-            evidence=evidence[:12000],
+            evidence=redact_sensitive(evidence[:12000]),
             impact=impact[:4000],
             recommendation=recommendation[:6000],
             verification=first_text(
@@ -1409,6 +1929,16 @@ class OrchestratorAgent(Agent):
             remediation_status=remediation_status,
             verification_status=verification_status,
             risk_status=risk_status,
+            request_id=first_text("request_id", "_request_id", default="")[:80] or None,
+            confidence_score=finding.get("confidence_score"),
+            confidence_label=first_text("confidence_label", default="")[:20] or None,
+            reproduction_command=first_text("reproduction_command", default="")[:4000] or None,
+            request_response_diff=first_text("request_response_diff", default="")[:12000] or None,
+            verification_hash=first_text("verification_hash", default="")[:128] or None,
+            verification_method=first_text("verification_method", default="")[:120] or None,
+            verification_stage=first_text("verification_stage", default="")[:120] or None,
+            verification_result=finding.get("verification_result") if isinstance(finding.get("verification_result"), dict) else None,
+            source_correlation=finding.get("source_correlation") if isinstance(finding.get("source_correlation"), dict) else None,
         )
 
     @staticmethod
@@ -1419,7 +1949,7 @@ class OrchestratorAgent(Agent):
         # DB rows and freshly normalized findings and would cause duplicates
         # to be re-inserted. All identity fields are plain strings or None,
         # so the tuple is always hashable.
-        identity = ("title", "category", "severity", "target", "endpoint", "file_path", "line_number", "parameter", "module", "cve_id")
+        identity = ("title", "category", "target", "endpoint", "file_path", "line_number", "parameter", "module", "cve_id")
         return tuple(data[name] for name in identity)
 
     async def set_progress(
@@ -1430,25 +1960,46 @@ class OrchestratorAgent(Agent):
         *,
         request_count: int | None = None,
         sandbox_id: str | None = None,
-    ) -> None:
+        publish_event: bool = True,
+    ) -> int:
+        async with self._progress_lock:
+            previous = self._progress_by_scan.get(scan_id, 0)
+            effective_progress = max(previous, max(0, min(int(progress), 100)))
+            self._progress_by_scan[scan_id] = effective_progress
         await update_scan_progress(
             scan_id,
-            progress,
+            effective_progress,
             request_count=request_count,
             sandbox_id=sandbox_id,
         )
-        payload: dict[str, Any] = {"progress": progress, "phase": phase, "status": "running"}
+        payload: dict[str, Any] = {"progress": effective_progress, "phase": phase, "status": "running"}
         if request_count is not None:
             payload["request_count"] = request_count
         if sandbox_id is not None:
             payload["sandbox_id"] = sandbox_id
-        await self.publish(scan_id, "scan_progress", payload)
+        if publish_event:
+            await self.publish(scan_id, "scan_progress", payload)
+        return effective_progress
 
     async def publish(self, scan_id: int, event: str, payload: dict[str, Any]) -> None:
-        await scan_event_broker.publish(
-            scan_id,
-            {"event": event, "type": event, "payload": payload},
-        )
+        payload = dict(payload)
+        raw_progress = payload.get("progress")
+        normalized_progress = safe_int(raw_progress)
+        if normalized_progress is not None:
+            async with self._progress_lock:
+                previous = self._progress_by_scan.get(scan_id, 0)
+                effective_progress = max(previous, max(0, min(normalized_progress, 100)))
+                self._progress_by_scan[scan_id] = effective_progress
+            payload["progress"] = effective_progress
+        print(f"[DEBUG] scan_id={scan_id} – publish event={event} payload_progress={payload.get('progress', '?')}")
+        try:
+            await scan_event_broker.publish(
+                scan_id,
+                {"event": event, "type": event, "payload": payload},
+            )
+            print(f"[DEBUG] scan_id={scan_id} – publish OK for event={event}")
+        except Exception as exc:
+            print(f"[DEBUG] scan_id={scan_id} – publish FAILED for event={event}: {exc}")
 
     async def _write_report_files(
         self, summary: dict[str, Any], scan_id: int, target_url: str,

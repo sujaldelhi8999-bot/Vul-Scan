@@ -2,10 +2,11 @@ from datetime import datetime
 from typing import Any, Literal, Optional
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator, HttpUrl
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator, HttpUrl
 
 
 Mode = Literal["defend", "pentest", "multi_agent"]
+ScanDepth = Literal["quick", "standard", "deep", "stealth"]
 JobStatus = Literal["QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"]
 Intensity = Literal["low", "medium", "high"]
 Severity = Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
@@ -228,19 +229,66 @@ class BusinessLogicTest(BaseModel):
 # Backward compatibility - original ScanRequest for existing agents
 class ScanRequest(BaseModel):
     """Legacy scan request for backward compatibility."""
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    target_url: str = Field(min_length=4, max_length=2048)
-    mode: Mode
+    target_url: str = Field(min_length=4, max_length=2048, validation_alias=AliasChoices("target_url", "target"))
+    mode: Mode = "defend"
+    scan_depth: ScanDepth = "quick"
+    profile: ScanDepth | None = None
     intensity: Intensity = "medium"
+    severity_filters: list[Severity] = Field(default_factory=lambda: ["LOW", "MEDIUM", "HIGH", "CRITICAL"])
     selected_tests: list[TestModule] = Field(default_factory=list, max_length=25)
     attack_types: list[TestModule] = Field(default_factory=list, max_length=25)
     authorization_id: int | None = Field(default=None, ge=1)
     authorization_confirmed: bool = False
     business_logic_tests: list[BusinessLogicTest] = Field(default_factory=list, max_length=10)
+    confidence_profile: Literal["strict", "balanced", "aggressive"] = Field(
+        default="balanced",
+        validation_alias=AliasChoices("confidence_profile", "confidence_sensitivity"),
+    )
     enable_exploitation: bool = False
     enable_ai_exploitation: bool = False
     approval_request_id: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_scan_depth_mode(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        values = dict(data)
+        requested_scan_depth = str(values.get("scan_depth") or "").lower()
+        if requested_scan_depth in {"quick", "standard", "deep", "stealth"}:
+            values["scan_depth"] = requested_scan_depth
+        requested_mode = str(values.get("mode") or "").lower()
+        if requested_mode in {"quick", "standard", "deep", "stealth"}:
+            values.setdefault("scan_depth", requested_mode)
+            values["mode"] = "defend"
+        requested_profile = str(values.get("profile") or "").lower()
+        if requested_profile in {"quick", "standard", "deep", "stealth"}:
+            values["scan_depth"] = requested_profile
+            values["profile"] = requested_profile
+        if "confidence" in values and "confidence_profile" not in values and "confidence_sensitivity" not in values:
+            values["confidence_profile"] = values.pop("confidence")
+        return values
+
+    @field_validator("target_url", mode="before")
+    @classmethod
+    def clean_target_url(cls, value: Any) -> str:
+        target = str(value or "").strip().split("#", 1)[0].rstrip("/")
+        if target and "://" not in target:
+            target = f"https://{target}"
+        return target
+
+    @field_validator("severity_filters", mode="before")
+    @classmethod
+    def normalize_severity_filters(cls, value: Any) -> list[str]:
+        if value is None or value == "":
+            return ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        if isinstance(value, str):
+            value = [item.strip() for item in value.split(",")]
+        if not isinstance(value, list):
+            raise ValueError("severity_filters must be a list of severities")
+        return [str(item).strip().upper() for item in value if str(item).strip()]
 
     @model_validator(mode="after")
     def normalize_test_selection(self) -> "ScanRequest":
@@ -249,6 +297,7 @@ class ScanRequest(BaseModel):
         selected = self.selected_tests or self.attack_types
         self.selected_tests = list(dict.fromkeys(selected))
         self.attack_types = []
+        self.profile = self.scan_depth
         return self
 
 
@@ -453,6 +502,16 @@ class FindingCreate(BaseModel):
     remediation_status: Literal["OPEN", "IN_PROGRESS", "RESOLVED"] = "OPEN"
     verification_status: Literal["NOT_VERIFIED", "FIX_VERIFIED", "ISSUE_STILL_PRESENT", "VERIFY_FAILED"] = "NOT_VERIFIED"
     risk_status: Literal["ACTIVE", "FALSE_POSITIVE", "ACCEPTED_RISK"] = "ACTIVE"
+    request_id: str | None = Field(default=None, max_length=80)
+    confidence_score: float | None = Field(default=None, ge=0, le=1)
+    confidence_label: str | None = Field(default=None, max_length=20)
+    reproduction_command: str | None = Field(default=None, max_length=4000)
+    request_response_diff: str | None = Field(default=None, max_length=12000)
+    verification_hash: str | None = Field(default=None, max_length=128)
+    verification_method: str | None = Field(default=None, max_length=120)
+    verification_stage: str | None = Field(default=None, max_length=120)
+    verification_result: dict[str, Any] | None = None
+    source_correlation: dict[str, Any] | None = None
     exploited: bool = False
     exploitation_result: dict[str, Any] | None = None
     poc: dict[str, Any] | None = None
@@ -518,6 +577,16 @@ class ScanHistoryItem(BaseModel):
     completed_at: datetime | None = None
     findings_count: int = 0
     critical_findings_count: int = 0
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
+
+
+class ScanHistoryResponse(BaseModel):
+    scans: list[ScanHistoryItem]
+    total: int
+    limit: int
+    offset: int
     high_findings_count: int = 0
 
 
@@ -590,6 +659,11 @@ class ScanArtifactsResponse(BaseModel):
     ai_analyst_output: dict[str, Any] | None = None
     tci_output: dict[str, Any] | None = None
     ai_consultation: dict[str, Any] | None = None
+    vuln_findings: list[dict[str, Any]] | None = None
+    verified_findings: list[dict[str, Any]] | None = None
+    attack_graph: dict[str, Any] | None = None
+    attack_paths: list[Any] | None = None
+    path_validations: list[dict[str, Any]] | None = None
     updated_at: datetime | None = None
 
 

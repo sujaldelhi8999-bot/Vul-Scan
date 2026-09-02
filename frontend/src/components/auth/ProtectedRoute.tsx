@@ -2,17 +2,20 @@ import React from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { Loader2 } from 'lucide-react';
+import { hasPlatformAdminAccess } from '../../utils/access';
 
 interface ProtectedRouteProps {
   children: React.ReactNode;
   requiredTier?: 'FREE' | 'PRO' | 'ENTERPRISE';
   requireEnterprise?: boolean;
+  requireAdmin?: boolean;
 }
 
 export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ 
   children, 
   requiredTier = 'FREE',
   requireEnterprise = false,
+  requireAdmin = false,
 }) => {
   const { user, isLoading } = useAuth();
   const location = useLocation();
@@ -39,6 +42,10 @@ export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({
 
   if (requireEnterprise && !user.enterpriseId) {
     return <Navigate to="/dashboard" replace state={{ from: location, message: 'Enterprise membership required' }} />;
+  }
+
+  if (requireAdmin && !hasPlatformAdminAccess(user)) {
+    return <Navigate to="/dashboard" replace state={{ from: location, message: 'Platform admin privileges required' }} />;
   }
 
   return <>{children}</>;

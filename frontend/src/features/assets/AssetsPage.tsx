@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Drawer, EmptyState, Page, PageHeader, Panel, SectionHeader, SeverityBadge, StatusBadge } from '../../components/ui/Primitives';
 import { usePhantomData } from '../../hooks/usePhantomData';
-import { deriveAssets, formatDateTime, relativeTime } from '../../utils/derived';
+import { deriveAssets, formatDateTime, relativeTime, scanDisplayTimestamp } from '../../utils/derived';
 
 type Asset = ReturnType<typeof deriveAssets>[number];
 
@@ -10,20 +10,45 @@ export default function AssetsPage() {
   const assets = useMemo(() => deriveAssets(scans, findings), [scans, findings]);
   const [selected, setSelected] = useState<Asset | null>(null);
   const [tab, setTab] = useState('Overview');
-  const technologies = useMemo(() => {
+  const selectedArtifact = selected?.scans[0] ? artifactsByScanId[selected.scans[0].id] : undefined;
+  const selectedTechnologies = useMemo(() => {
     const seen = new Set<string>();
     const result: string[] = [];
-    for (const artifact of Object.values(artifactsByScanId)) {
-      const stack = artifact.scanner_output?.tech_stack;
-      if (!stack || typeof stack !== 'object') continue;
-      const record = stack as Record<string, unknown>;
-      const values = [record.server, record.x_powered_by, ...(Array.isArray(record.technologies) ? record.technologies : [])];
-      for (const v of values) {
-        if (typeof v === 'string' && v.trim() && !seen.has(v.trim())) { seen.add(v.trim()); result.push(v.trim()); }
+    const stack = selectedArtifact?.scanner_output?.tech_stack;
+    if (!stack || typeof stack !== 'object') return result;
+    const record = stack as Record<string, unknown>;
+    const detailed = Array.isArray(record.detailed) ? record.detailed : [];
+    const values = [record.server, record.x_powered_by, ...(Array.isArray(record.technologies) ? record.technologies : [])];
+    for (const item of detailed) {
+      if (item && typeof item === 'object') {
+        const tech = item as Record<string, unknown>;
+        const name = typeof tech.name === 'string' ? tech.name.trim() : '';
+        const version = typeof tech.version === 'string' && tech.version.trim() ? ` ${tech.version.trim()}` : '';
+        if (name) values.push(`${name}${version}`);
       }
     }
+    for (const v of values) {
+      if (typeof v === 'string' && v.trim() && !seen.has(v.trim())) { seen.add(v.trim()); result.push(v.trim()); }
+    }
     return result;
-  }, [artifactsByScanId]);
+  }, [selectedArtifact]);
+  const selectedEndpoints = useMemo(() => {
+    const values: string[] = selected?.findings
+      .map((finding) => finding.endpoint)
+      .filter((endpoint): endpoint is string => Boolean(endpoint)) ?? [];
+    const browser = selectedArtifact?.browser_security_output;
+    if (browser && typeof browser === 'object') {
+      const record = browser as Record<string, unknown>;
+      for (const item of [...(Array.isArray(record.routes) ? record.routes : []), ...(Array.isArray(record.pages) ? record.pages : [])]) {
+        if (typeof item === 'string') values.push(item);
+        if (item && typeof item === 'object') {
+          const value = (item as Record<string, unknown>).url ?? (item as Record<string, unknown>).path;
+          if (typeof value === 'string') values.push(value);
+        }
+      }
+    }
+    return Array.from(new Set(values));
+  }, [selected, selectedArtifact]);
 
   const tabs = ['Overview', 'Findings', 'Technologies', 'Endpoints', 'Scans'];
 
@@ -52,7 +77,7 @@ export default function AssetsPage() {
                 </div>
                 <div className="rounded-lg bg-[var(--surface-secondary)] px-2 py-1.5 text-center">
                   <div className="text-[10px] text-[var(--text-muted)]">Findings</div>
-                  <div className="text-sm font-semibold text-[var(--text-strong)]">{asset.findings.length}</div>
+                  <div className="text-sm font-semibold text-[var(--text-strong)]">{asset.findings_count}</div>
                 </div>
                 <div className="rounded-lg bg-[var(--surface-secondary)] px-2 py-1.5 text-center">
                   <div className="text-[10px] text-[var(--text-muted)]">Scans</div>
@@ -111,9 +136,9 @@ export default function AssetsPage() {
             ) : null}
 
             {tab === 'Technologies' ? (
-              technologies.length ? (
+              selectedTechnologies.length ? (
                 <div className="space-y-1">
-                  {technologies.map((tech) => (
+                  {selectedTechnologies.map((tech) => (
                     <div key={tech} className="rounded-lg bg-[var(--surface-secondary)] px-3 py-2 font-mono text-xs text-[var(--text-strong)]">{tech}</div>
                   ))}
                 </div>
@@ -122,7 +147,7 @@ export default function AssetsPage() {
 
             {tab === 'Endpoints' ? (
               <div className="space-y-1">
-                {Array.from(new Set(selected.findings.map((f) => f.endpoint).filter(Boolean))).map((ep) => (
+                {selectedEndpoints.map((ep) => (
                   <div key={ep} className="rounded-lg bg-[var(--surface-secondary)] px-3 py-2 font-mono text-xs text-[var(--text-default)]">{ep}</div>
                 ))}
               </div>
@@ -134,7 +159,7 @@ export default function AssetsPage() {
                   <div key={scan.id} className="flex items-center justify-between rounded-xl bg-[var(--surface-secondary)] px-3 py-2.5">
                     <div>
                       <div className="text-xs text-[var(--text-strong)]">Scan {scan.id}</div>
-                      <div className="text-[10px] text-[var(--text-muted)]">{formatDateTime(scan.created_at)}</div>
+                      <div className="text-[10px] text-[var(--text-muted)]">{formatDateTime(scanDisplayTimestamp(scan))}</div>
                     </div>
                     <StatusBadge status={scan.status} />
                   </div>

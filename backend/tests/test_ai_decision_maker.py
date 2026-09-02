@@ -1,12 +1,8 @@
 import json
 import os
-import tempfile
 import time
 from unittest import IsolatedAsyncioTestCase
 
-_db_fd, _db_path = tempfile.mkstemp(suffix=".sqlite3")
-os.close(_db_fd)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 os.environ.setdefault("MAX_TOTAL_REQUESTS", "50")
 os.environ.setdefault("MAX_REQUESTS_PER_SECOND", "100")
 

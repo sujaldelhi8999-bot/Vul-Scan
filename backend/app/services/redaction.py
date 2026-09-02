@@ -62,13 +62,17 @@ class SecretRedactionService:
 
     def redact_url(self, url: str) -> str:
         parsed = urlsplit(str(url))
+        netloc = parsed.netloc
+        if "@" in netloc:
+            host = netloc.rsplit("@", 1)[1]
+            netloc = f"[REDACTED]@{host}"
         query = urlencode(
             [
                 (key, self.mask_value(value) if value or key.lower() in self.SENSITIVE_KEYS else "")
                 for key, value in parse_qsl(parsed.query, keep_blank_values=True)
             ]
         )
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
+        return urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
 
     def redact_headers(self, headers: dict[str, Any]) -> dict[str, Any]:
         safe: dict[str, Any] = {}

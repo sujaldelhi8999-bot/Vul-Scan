@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { ChevronDown, ChevronRight, Download, GitCompareArrows, Printer, RotateCcw, Sparkles } from 'lucide-react';
+import { ChevronDown, ChevronRight, Copy, Download, GitCompareArrows, Printer, RotateCcw, Sparkles } from 'lucide-react';
 
 import {
   Button,
@@ -52,6 +52,44 @@ function displayValue(value: unknown): string {
   if (Array.isArray(value)) return value.map((item) => text(item)).filter(Boolean).join(', ') || 'None';
   if (value && typeof value === 'object') return JSON.stringify(value);
   return text(value, 'None');
+}
+
+function VerificationTrace({ finding }: { finding: Finding }) {
+  const [diffOpen, setDiffOpen] = useState(false);
+  const copyCommand = async () => {
+    if (!finding.reproduction_command) return;
+    await navigator.clipboard.writeText(finding.reproduction_command);
+    toast.success('curl command copied');
+  };
+  if (!finding.reproduction_command && !finding.request_response_diff && !finding.request_id && !finding.verification_hash) return null;
+  return (
+    <div className="rounded-md border border-[var(--border-subtle)] p-2">
+      <div className="mb-1 flex flex-wrap items-center gap-1.5 text-[10px] text-[var(--text-muted)]">
+        <span className="font-semibold text-[var(--text-secondary)]">Verification Trace</span>
+        {finding.confidence_label ? <StatusBadge status={finding.confidence_label} /> : null}
+        {typeof finding.confidence_score === 'number' ? <StatusBadge status={`${Math.round(finding.confidence_score * 100)}%`} /> : null}
+        {finding.request_id ? <code>request:{finding.request_id}</code> : null}
+        {finding.verification_hash ? <code className="break-all">hash:{finding.verification_hash}</code> : null}
+      </div>
+      {finding.reproduction_command ? (
+        <div>
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="text-[10px] font-semibold text-[var(--text-muted)]">curl</span>
+            <Button variant="secondary" onClick={copyCommand}><Copy className="h-3.5 w-3.5" /> Copy</Button>
+          </div>
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-[var(--bg-inset)] p-2 font-mono text-[10px] text-[var(--text-secondary)]">{finding.reproduction_command}</pre>
+        </div>
+      ) : null}
+      {finding.request_response_diff ? (
+        <div className="mt-1">
+          <button className="text-[10px] font-semibold text-[var(--accent-hover)]" onClick={() => setDiffOpen((value) => !value)}>
+            {diffOpen ? 'Hide' : 'Show'} diff
+          </button>
+          {diffOpen ? <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-[var(--bg-inset)] p-2 font-mono text-[10px] text-[var(--text-secondary)]">{finding.request_response_diff}</pre> : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 /* ── Executive Summary ── */
@@ -124,6 +162,7 @@ function FindingCard({ finding }: { finding: Finding }) {
               <code className="mt-0.5 block break-all font-mono text-xs text-[var(--accent-hover)]">{finding.endpoint}</code>
             </div>
           ) : null}
+          <VerificationTrace finding={finding} />
           {finding.recommendation || finding.fix ? (
             <div>
               <div className="text-[10px] font-semibold text-[var(--text-muted)]">Remediation</div>

@@ -96,20 +96,29 @@ class CVEMatcherAgent(Agent):
     def __init__(self) -> None:
         super().__init__("CVE Matcher Agent")
         self.settings = get_settings()
+        self.provider_errors: list[dict[str, Any]] = []
 
     async def run(
         self, tech_stack: dict[str, Any], scan_id: int
     ) -> dict[str, list[dict[str, Any]]]:
         self.scan_id = scan_id
         self.status = "active"
+        self.provider_errors = []
         await self.log_action("started", "Matching CVEs")
 
         technologies = self._extract_technologies(tech_stack)
         matches: list[dict[str, Any]] = []
 
-        tasks = [self._search_nvd(tech) for tech in technologies]
-        nvd_results = await asyncio.gather(*tasks)
-        for results in nvd_results:
+        lookup_timeout = self._nvd_timeout()
+        tasks = [asyncio.wait_for(self._search_nvd(tech), timeout=lookup_timeout) for tech in technologies]
+        nvd_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for technology, results in zip(technologies, nvd_results, strict=False):
+            if isinstance(results, asyncio.TimeoutError):
+                self.provider_errors.append({"provider": "NVD", "error_type": "DEPENDENCY_UNAVAILABLE", "technology": technology, "message": f"NVD lookup timed out after {lookup_timeout:g}s"})
+                continue
+            if isinstance(results, Exception):
+                self.provider_errors.append({"provider": "NVD", "error_type": "INTERNAL_SCANNER_ERROR", "technology": technology, "message": str(results)[:300]})
+                continue
             matches.extend(results)
 
         body = str(tech_stack.get("headers", {}))
@@ -118,14 +127,17 @@ class CVEMatcherAgent(Agent):
 
         for m in matches:
             score = m.get("cvss_score")
-            m["poc_likely"] = bool(score is not None and float(score) >= 3.0)
+            try:
+                m["poc_likely"] = bool(score is not None and float(score) >= 3.0)
+            except (TypeError, ValueError):
+                m["poc_likely"] = False
 
         matches = self._filter_version_applicable(matches)
         matches = await self._ml_validate_versions(matches)
 
         self.status = "complete"
         await self.log_action("completed", f"Matched {len(matches)} CVEs (after version filtering)")
-        return {"cve_matches": matches}
+        return {"cve_matches": matches, "provider_errors": self.provider_errors}
 
     async def _ml_validate_versions(self, matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
         try:
@@ -154,9 +166,6 @@ class CVEMatcherAgent(Agent):
                 continue
 
             if self._is_version_in_range(detected_version, version_affected):
-                filtered.append(m)
-            elif m.get("cve_id", "").startswith("CVE-"):
-                m["confidence_note"] = "CVE present in NVD but detected version may not be in vulnerable range"
                 filtered.append(m)
         return filtered
 
@@ -222,7 +231,7 @@ class CVEMatcherAgent(Agent):
         cpe = self._build_cpe(technology)
         matches: list[dict[str, Any]] = []
 
-        async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=self._nvd_timeout(), verify=False) as client:
             if cpe:
                 # CPE-based search for known technologies
                 for severity in SEVERITY_ORDER:
@@ -233,34 +242,50 @@ class CVEMatcherAgent(Agent):
                     try:
                         r = await client.get(url, headers={"apiKey": self.settings.nvd_api_key})
                         r.raise_for_status()
-                    except Exception as e:
-                        logger.debug("Error: %s", e)
+                    except httpx.HTTPStatusError as e:
+                        status_code = e.response.status_code
+                        self.provider_errors.append({"provider": "NVD", "error_type": "RATE_LIMITED" if status_code == 429 else "DEPENDENCY_UNAVAILABLE", "status_code": status_code, "technology": technology})
+                        logger.debug("NVD error for %s: %s", technology, e)
+                        if status_code in {429, 500, 502, 503, 504}:
+                            break
+                        continue
+                    except (httpx.TimeoutException, httpx.HTTPError) as e:
+                        self.provider_errors.append({"provider": "NVD", "error_type": "DEPENDENCY_UNAVAILABLE", "technology": technology, "message": str(e)[:200]})
+                        logger.debug("NVD request error for %s: %s", technology, e)
                         continue
 
-                    data = r.json()
+                    try:
+                        data = r.json()
+                    except ValueError as exc:
+                        self.provider_errors.append({"provider": "NVD", "error_type": "MALFORMED_RESPONSE", "technology": technology})
+                        logger.debug("Malformed NVD response for %s: %s", technology, exc)
+                        continue
                     for item in data.get("vulnerabilities", [])[:5]:
-                        cve = item.get("cve", {})
-                        cve_id = cve.get("id", "")
-                        descs = cve.get("descriptions", [])
-                        desc = next(
-                            (e.get("value", "") for e in descs if e.get("lang") == "en"), ""
-                        )
-                        score = self._extract_cvss(cve.get("metrics", {}))
-                        cwes = self._extract_cwe(cve)
-                        vuln_configs = self._extract_vulnerable_configs(item)
+                        try:
+                            cve = item.get("cve", {})
+                            cve_id = cve.get("id", "")
+                            descs = cve.get("descriptions", [])
+                            desc = next(
+                                (e.get("value", "") for e in descs if e.get("lang") == "en"), ""
+                            )
+                            score = self._extract_cvss(cve.get("metrics", {}))
+                            cwes = self._extract_cwe(cve)
+                            vuln_configs = self._extract_vulnerable_configs(item)
 
-                        version_match = self._match_version(vuln_configs, technology)
+                            version_match = self._match_version(vuln_configs, technology)
 
-                        matches.append({
-                            "cve_id": cve_id,
-                            "cvss_score": score,
-                            "severity": severity,
-                            "affected_component": technology,
-                            "description": desc[:300],
-                            "cwe": cwes,
-                            "version_affected": version_match,
-                            "poc_likely": bool(score is not None and float(score) >= 3.0),
-                        })
+                            matches.append({
+                                "cve_id": cve_id,
+                                "cvss_score": score,
+                                "severity": severity,
+                                "affected_component": technology,
+                                "description": desc[:300],
+                                "cwe": cwes,
+                                "version_affected": version_match,
+                                "poc_likely": bool(score is not None and float(score) >= 3.0),
+                            })
+                        except Exception as exc:
+                            self.provider_errors.append({"provider": "NVD", "error_type": "MALFORMED_RESPONSE", "technology": technology, "message": str(exc)[:200]})
             else:
                 # Keyword-based search for unmapped technologies
                 # Only search the technology name (not version) to avoid bad queries
@@ -297,10 +322,22 @@ class CVEMatcherAgent(Agent):
                             "version_affected": None,
                             "poc_likely": bool(score is not None and float(score) >= 3.0),
                         })
-                except Exception as e:
+                except httpx.HTTPStatusError as e:
+                    status_code = e.response.status_code
+                    self.provider_errors.append({"provider": "NVD", "error_type": "RATE_LIMITED" if status_code == 429 else "DEPENDENCY_UNAVAILABLE", "status_code": status_code, "technology": technology})
+                    logger.debug("Keyword search error: %s", e)
+                except (httpx.TimeoutException, httpx.HTTPError, ValueError) as e:
+                    self.provider_errors.append({"provider": "NVD", "error_type": "DEPENDENCY_UNAVAILABLE", "technology": technology, "message": str(e)[:200]})
                     logger.debug("Keyword search error: %s", e)
 
         return matches
+
+    def _nvd_timeout(self) -> float:
+        try:
+            timeout = float(getattr(self.settings, "nvd_lookup_timeout", 10.0))
+        except (TypeError, ValueError):
+            return 10.0
+        return timeout if timeout > 0 else 10.0
 
     def _extract_cwe(self, cve: dict[str, Any]) -> list[str]:
         cwes: list[str] = []
@@ -379,7 +416,10 @@ class CVEMatcherAgent(Agent):
                 data = entries[0].get("cvssData", {})
                 s = data.get("baseScore")
                 if s is not None:
-                    return float(s)
+                    try:
+                        return float(s)
+                    except (TypeError, ValueError):
+                        return None
         return None
 
     def _check_js_libs(self, body: str) -> list[dict[str, Any]]:

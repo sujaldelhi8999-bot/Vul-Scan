@@ -158,27 +158,42 @@ const severityConfig: Record<Severity, { bg: string; text: string; dot: string; 
   INFO: { bg: 'bg-gray-50', text: 'text-gray-500', dot: 'bg-gray-400', label: 'INFO' },
 };
 
-export function SeverityBadge({ severity, compact }: { severity: Severity; compact?: boolean }) {
-  const cfg = severityConfig[severity];
+function normalizeSeverity(value: unknown): Severity {
+  const normalized = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  return normalized in severityConfig ? normalized as Severity : 'INFO';
+}
+
+export function SeverityBadge({ severity, compact }: { severity: Severity | string | null | undefined; compact?: boolean }) {
+  const safeSeverity = normalizeSeverity(severity);
+  const cfg = severityConfig[safeSeverity];
   return (
     <span className={cx('inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-semibold text-[10px]', cfg.bg, cfg.text)}>
       <span className={cx('h-1.5 w-1.5 rounded-full shrink-0', cfg.dot)} />
-      {compact ? cfg.label : severity}
+      {compact ? cfg.label : safeSeverity}
     </span>
   );
 }
 
-export function DotSeverity({ severity }: { severity: Severity }) {
-  const cfg = severityConfig[severity];
-  return <span className={cx('h-1.5 w-1.5 rounded-full shrink-0', cfg.dot)} title={severity} />;
+export function DotSeverity({ severity }: { severity: Severity | string | null | undefined }) {
+  const safeSeverity = normalizeSeverity(severity);
+  const cfg = severityConfig[safeSeverity];
+  return <span className={cx('h-1.5 w-1.5 rounded-full shrink-0', cfg.dot)} title={safeSeverity} />;
 }
 
-const statusStyle = (status: string) => {
-  const n = status.toLowerCase();
+export function normalizeStatusText(status: unknown): { normalized: string; label: string } {
+  const text = typeof status === 'string' && status.trim() ? status.trim() : 'UNKNOWN';
+  return {
+    normalized: text.toLowerCase(),
+    label: text.toUpperCase().replace(/_/g, ' '),
+  };
+}
+
+const statusStyle = (status: unknown) => {
+  const n = normalizeStatusText(status).normalized;
   const ok = n.includes('complete') || n.includes('connected') || n.includes('verified') || n.includes('healthy') || n === 'pass' || n === 'live' || n === 'resolved' || n === 'fix_verified';
   const active = n.includes('running') || n.includes('active') || n.includes('queued') || n.includes('progress') || n.includes('starting') || n.includes('pending') || n === 'open' || n === 'in_progress';
   const err = n.includes('cancel') || n.includes('error') || n.includes('failed') || n.includes('timeout') || n.includes('timed_out') || n.includes('timed out') || n.includes('critical') || n.includes('blocked') || n === 'false_positive' || n === 'issue_still_present';
-  const warn = n.includes('attention') || n.includes('degraded') || n.includes('warning') || n.includes('na') || n.includes('expired') || n.includes('revoked');
+  const warn = n.includes('attention') || n.includes('degraded') || n.includes('warning') || n === 'na' || n === 'n/a' || n.includes('expired') || n.includes('revoked') || n === 'unknown';
   if (ok) return 'bg-[var(--success-soft)] text-[var(--success)]';
   if (active) return 'bg-[var(--brand-soft)] text-[var(--brand)]';
   if (err) return 'bg-[var(--danger-soft)] text-[var(--danger)]';
@@ -186,10 +201,11 @@ const statusStyle = (status: string) => {
   return 'text-[var(--text-muted)] bg-[var(--surface-tertiary)]';
 };
 
-export function StatusBadge({ status }: { status: string }) {
+export function StatusBadge({ status }: { status: unknown }) {
+  const { label } = normalizeStatusText(status);
   return (
     <span className={cx('inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider', statusStyle(status))}>
-      {status.replace(/_/g, ' ')}
+      {label}
     </span>
   );
 }

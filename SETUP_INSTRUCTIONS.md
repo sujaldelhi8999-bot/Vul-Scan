@@ -20,11 +20,14 @@ cd phantomscan
 
 ## 3. Configure Environment Files
 
-Create backend and frontend `.env` files from the examples.
+Create environment files from the examples. The root `.env` is used by Docker
+Compose variable substitution; `backend/.env` and `frontend/.env` are useful for
+running the services directly without Docker.
 
 On macOS/Linux:
 
 ```bash
+cp .env.example .env
 cp backend/.env.example backend/.env
 cp frontend/.env.example frontend/.env
 ```
@@ -32,11 +35,12 @@ cp frontend/.env.example frontend/.env
 On Windows PowerShell:
 
 ```powershell
+Copy-Item .env.example .env
 Copy-Item backend/.env.example backend/.env
 Copy-Item frontend/.env.example frontend/.env
 ```
 
-Open `backend/.env` and set at least this required value:
+Open `.env` and `backend/.env` and set at least this required value:
 
 ```env
 SECRET_KEY=replace-with-a-long-random-secret
@@ -57,13 +61,16 @@ Optional values you can add later:
 For local frontend development, keep `frontend/.env` like this unless your backend port changes:
 
 ```env
-VITE_API_BASE_URL=http://127.0.0.1:8000
-VITE_WS_BASE_URL=ws://127.0.0.1:8000
+VITE_API_BASE_URL=http://localhost:8000
+VITE_WS_BASE_URL=ws://localhost:8000
 ```
 
 ## 4. Run With Docker Compose
 
-This is the easiest way because it starts the backend, frontend, PostgreSQL, and Redis together.
+This is the easiest way because it starts the backend and frontend together.
+The current PhantomScan runtime uses SQLite, persisted in the Docker volume
+`phantomscan_sqlite`; PostgreSQL/TimescaleDB is not required for the default
+stack.
 
 ```bash
 docker compose -f docker/docker-compose.yml up --build
@@ -79,6 +86,13 @@ To stop everything, press `Ctrl+C`, then run:
 
 ```bash
 docker compose -f docker/docker-compose.yml down
+```
+
+Optional future development services are available behind Compose profiles:
+
+```bash
+docker compose -f docker/docker-compose.yml --profile postgres up postgres
+docker compose -f docker/docker-compose.yml --profile redis up redis
 ```
 
 ## 5. Run Locally Without Docker

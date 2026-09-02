@@ -4,6 +4,7 @@ even when external tools (semgrep, truffleHog, gitleaks) are not installed.
 """
 
 import logging
+import fnmatch
 import os
 import re
 from dataclasses import dataclass, field
@@ -64,6 +65,21 @@ SKIP_DIRS = {"node_modules", ".git", "vendor", "dist", "build", "__pycache__", "
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
+def _excluded_by_pattern(file_path: Path, target: Path, exclude_patterns: list[str]) -> bool:
+    try:
+        rel = file_path.relative_to(target if target.is_dir() else target.parent).as_posix()
+    except ValueError:
+        rel = file_path.as_posix()
+    name = file_path.name
+    for raw_pattern in exclude_patterns:
+        pattern = raw_pattern.strip().replace("\\", "/").lstrip("./")
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern) or Path(rel).match(pattern):
+            return True
+    return False
+
+
 @dataclass
 class RegexFinding:
     type: str
@@ -86,9 +102,10 @@ class RegexScanResult:
 class RegexFallbackScanner:
     """Scans a codebase for dangerous patterns and secrets using pure regex."""
 
-    async def scan(self, path: str, sensitivity: str = "medium") -> RegexScanResult:
+    async def scan(self, path: str, sensitivity: str = "medium", exclude_patterns: list[str] | None = None) -> RegexScanResult:
         result = RegexScanResult()
         root = Path(path)
+        excludes = exclude_patterns or []
         if not root.exists():
             logger.warning("Regex fallback scan: path does not exist: %s", path)
             return result
@@ -97,6 +114,8 @@ class RegexFallbackScanner:
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             for filename in filenames:
                 file_path = Path(dirpath) / filename
+                if _excluded_by_pattern(file_path, root, excludes):
+                    continue
                 ext = file_path.suffix.lower()
                 # Skip known binary formats
                 if ext in BINARY_EXTENSIONS:

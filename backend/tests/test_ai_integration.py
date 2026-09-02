@@ -96,6 +96,47 @@ class TestOpenRouterClient(unittest.TestCase):
                 self.assertTrue(any(log["response_status"] == "failed" for log in logs))
         asyncio.run(run_test())
 
+    def test_call_openrouter_retries_429_and_caches_success(self):
+        async def run_test():
+            request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+            responses = [
+                httpx.Response(429, request=request),
+                httpx.Response(200, request=request, json={"choices": [{"message": {"content": "cached answer"}}]}),
+            ]
+
+            class FakeClient:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                async def post(self, *_args, **_kwargs):
+                    return responses.pop(0)
+
+            with (
+                patch("app.services.openrouter_client.get_settings") as mock_settings,
+                patch("app.services.openrouter_client.httpx.AsyncClient", FakeClient),
+                patch("app.services.openrouter_client.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+            ):
+                mock_settings.return_value.openrouter_api_key = "sk-test-key"
+                mock_settings.return_value.openrouter_model = "openrouter/free"
+                ai_usage_logger.clear()
+                first = await call_openrouter("cacheable prompt", retry_limit=2)
+                second = await call_openrouter("cacheable prompt", retry_limit=2)
+
+            self.assertEqual(first, "cached answer")
+            self.assertEqual(second, "cached answer")
+            self.assertEqual(responses, [])
+            sleep_mock.assert_awaited_once()
+            self.assertTrue(any(log["response_status"] == "rate_limited_retry" for log in ai_usage_logger.get_logs()))
+            self.assertTrue(any(log["response_status"] == "cached" for log in ai_usage_logger.get_logs()))
+
+        asyncio.run(run_test())
+
 
 class TestAIAnalystFallback(unittest.TestCase):
     def test_ai_unavailable_response_format(self):

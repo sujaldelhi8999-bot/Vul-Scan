@@ -72,6 +72,18 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class WebSocketTicketRequest(BaseModel):
+    scope: str = Field(pattern="^(status|scan|brutal)$")
+    scan_id: int | None = Field(default=None, ge=1)
+
+
+class WebSocketTicketResponse(BaseModel):
+    ticket: str
+    expires_at: str
+    scope: str
+    scan_id: int | None = None
+
+
 def _hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -82,6 +94,7 @@ def _verify_password(password: str, password_hash: str) -> bool:
 
 ACCESS_TOKEN_TTL_HOURS = 24
 REFRESH_TOKEN_TTL_DAYS = 7
+WS_TICKET_TTL_SECONDS = 60
 
 
 def _issue_token(settings, user_id: str, role: str) -> str:
@@ -93,6 +106,20 @@ def _issue_token(settings, user_id: str, role: str) -> str:
         "exp": datetime.now(timezone.utc) + timedelta(hours=ACCESS_TOKEN_TTL_HOURS),
     }
     return jwt.encode(payload, settings.secret_key, algorithm="HS256")
+
+
+def _issue_ws_ticket(settings, user_id: str, scope: str, scan_id: int | None = None) -> tuple[str, str]:
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=WS_TICKET_TTL_SECONDS)
+    payload = {
+        "sub": user_id,
+        "typ": "ws-ticket",
+        "aud": "phantomscan-ws",
+        "scope": scope,
+        "scan_id": scan_id,
+        "jti": uuid.uuid4().hex,
+        "exp": expires_at,
+    }
+    return jwt.encode(payload, settings.secret_key, algorithm="HS256"), expires_at.isoformat()
 
 
 def _issue_refresh_token(settings, user_id: str) -> str:
@@ -305,6 +332,17 @@ async def get_me(user: dict = Depends(get_current_user)):
         can_manage_members=bool(user.get("can_manage_members")),
         allowed_email_domains=user.get("allowed_email_domains", []),
     )
+
+
+@router.post("/ws-ticket", response_model=WebSocketTicketResponse)
+async def issue_ws_ticket(req: WebSocketTicketRequest, user: dict = Depends(get_current_user)) -> WebSocketTicketResponse:
+    if req.scope == "scan" and req.scan_id is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="scan_id is required for scan WebSocket tickets")
+    settings = get_settings()
+    if not settings.secret_key:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server not configured: SECRET_KEY not set")
+    ticket, expires_at = _issue_ws_ticket(settings, user["id"], req.scope, req.scan_id)
+    return WebSocketTicketResponse(ticket=ticket, expires_at=expires_at, scope=req.scope, scan_id=req.scan_id)
 
 
 @router.post("/supabase", response_model=LoginResponse)

@@ -71,6 +71,25 @@ interface SastScan {
 
 const TERMINAL = new Set(['complete', 'error', 'cancelled']);
 const ACTIVE_REPO_ANALYSIS_KEY = 'vulscan:active-github-repo-analysis';
+const DEFAULT_EXCLUDE_PATTERNS = [
+  '**/*.md',
+  '**/*.rst',
+  '**/docs/**',
+  '**/documentation/**',
+  '**/examples/**',
+  '**/sample/**',
+  '**/samples/**',
+  '**/tests/**',
+  '**/test/**',
+  '**/__tests__/**',
+  '**/fixtures/**',
+  '**/fonts/**',
+  '**/i18n/**',
+  '**/locales/**',
+  '**/data/**',
+  '**/*.min.js',
+  '**/*.map',
+];
 
 const toolLabels: Record<string, string> = {
   semgrep: 'Static Analysis',
@@ -152,6 +171,7 @@ export default function CodeAnalysis() {
   const [repoUrl, setRepoUrl] = useState('');
   const [branch, setBranch] = useState('main');
   const [depth, setDepth] = useState('standard');
+  const [excludePatterns, setExcludePatterns] = useState(DEFAULT_EXCLUDE_PATTERNS.join('\n'));
   const [starting, setStarting] = useState(false);
   const [scan, setScan] = useState<SastScan | null>(null);
   const [error, setError] = useState('');
@@ -236,12 +256,16 @@ export default function CodeAnalysis() {
     setError('');
     setScan(null);
     const preset = DEPTH_PRESETS[depth] || DEPTH_PRESETS.standard;
+    const combinedExcludes = Array.from(new Set([
+      ...preset.excludes,
+      ...excludePatterns.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
+    ]));
     try {
       const response = await apiClient.post<{ scan_id: number }>('/api/sast/scan-repo', null, {
         params: {
           repo_url: url,
           branch: branch.trim() || 'main',
-          exclude_patterns: preset.excludes.join(','),
+          exclude_patterns: combinedExcludes.join(','),
           scan_timeout: preset.timeout,
           approval_request_id: approval?.id,
         },
@@ -412,6 +436,20 @@ export default function CodeAnalysis() {
               <GitBranch className="h-3 w-3" />
               Runs Semgrep, TruffleHog, Gitleaks, pip-audit / npm-audit, and IaC rules against the cloned repo.
             </p>
+            <div className="mt-4">
+              <label className="mb-1.5 block text-xs font-medium text-[var(--text-default)]">Exclude patterns</label>
+              <textarea
+                value={excludePatterns}
+                onChange={(e) => setExcludePatterns(e.target.value)}
+                disabled={starting || polling}
+                rows={4}
+                className="w-full rounded-md border border-[var(--border-light)] bg-[var(--surface-primary)] px-3 py-2 font-mono text-xs text-[var(--text-default)] focus:outline-none focus:ring-2 focus:ring-[var(--brand)]"
+                placeholder="**/*.md&#10;**/fonts/**&#10;**/i18n/**"
+              />
+              <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
+                One pattern per line or comma-separated. Defaults suppress docs, fonts, generated assets, test fixtures, and sample data while still scanning source and secrets.
+              </p>
+            </div>
           </div>
         </Panel>
 

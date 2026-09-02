@@ -14,6 +14,10 @@ export function hasElevatedAccess(user?: AccessUser | null): boolean {
   return (user?.role === 'admin' && !user.enterpriseId) || isEnterpriseOwner(user);
 }
 
+export function hasPlatformAdminAccess(user?: AccessUser | null): boolean {
+  return user?.role === 'admin' && !user.enterpriseId;
+}
+
 export function displayRole(user?: AccessUser | null): string {
   if (!user) return 'User';
   if (isEnterpriseOwner(user)) return 'Enterprise Owner';

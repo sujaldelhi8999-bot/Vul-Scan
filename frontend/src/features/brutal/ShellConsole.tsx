@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal, X } from 'lucide-react';
 import toast from 'react-hot-toast';
 
-import { expireSession, getWebSocketUrl, refreshSessionToken } from '../../services/api';
+import { createAuthenticatedWebSocket, expireSession, refreshSessionToken } from '../../services/api';
 import { Button } from '../../components/ui/Primitives';
 
 interface ShellConsoleProps {
@@ -32,7 +32,12 @@ export default function ShellConsole({ shellId, onClose }: ShellConsoleProps) {
         expireSession();
         return;
       }
-      socket = new WebSocket(getWebSocketUrl(`/ws/brutal/shell/${shellId}`));
+      try {
+        socket = await createAuthenticatedWebSocket(`/ws/brutal/shell/${shellId}`, 'brutal');
+      } catch {
+        setLines((prev) => [...prev, '[vulscan] failed to create authenticated shell connection']);
+        return;
+      }
       socketRef.current = socket;
 
       timer = setTimeout(() => {

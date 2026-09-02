@@ -62,6 +62,7 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
     label: 'Security',
     items: [
       { label: 'Findings', path: '/findings', icon: ShieldAlert },
+      { label: 'Attack Paths', path: '/attack-paths', icon: GitBranch },
       { label: 'Assets', path: '/assets', icon: Layers3 },
       { label: 'Reports', path: '/history', icon: FileText },
       { label: 'Agents', path: '/agents', icon: Network },
@@ -81,7 +82,7 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
     label: 'System',
     items: [
       { label: 'Attack Intelligence', path: '/intelligence', icon: BrainCircuit },
-      { label: 'Attack Planner', path: '/attack-planner', icon: Bug },
+      { label: 'Security Priorities', path: '/security-priorities', icon: Bug },
       { label: 'Scan Quality', path: '/quality', icon: ClipboardList },
       { label: 'Enterprise', path: '/enterprise', icon: Building2 },
       { label: 'System Health', path: '/system-health', icon: HeartPulse },
@@ -95,6 +96,7 @@ const routeDetails: Record<string, { title: string; description: string }> = {
   '/dashboard': { title: 'Security Overview', description: 'Monitor posture, active operations, findings, and recent security activity.' },
   '/scan': { title: 'Defend Scan', description: 'Run passive security assessments against targets.' },
   '/findings': { title: 'Findings', description: 'Triage detected vulnerabilities and risks.' },
+  '/attack-paths': { title: 'Attack Paths', description: 'Review verified exploitation chains and generated attack guides.' },
   '/assets': { title: 'Assets', description: 'Monitored targets from scan history.' },
   '/cve': { title: 'CVE Intelligence', description: 'Technology correlation with known vulnerabilities.' },
   '/remediation': { title: 'Remediation', description: 'Prioritize and verify fixes.' },
@@ -110,7 +112,7 @@ const routeDetails: Record<string, { title: string; description: string }> = {
   '/private/dos': { title: 'DoS Testing', description: 'Simulate Denial of Service attacks on authorized targets.' },
   '/code-analysis': { title: 'GitHub Repo Analysis', description: 'Scan GitHub repositories for secrets, insecure patterns, and vulnerable dependencies.' },
   '/brutal': { title: 'Brutal Mode', description: 'Active exploitation, interactive shells, post-exploitation, lateral movement & exfiltration.' },
-  '/attack-planner': { title: 'Attack Planner', description: 'Analyze targets and generate prioritized attack plans with realistic commands.' },
+  '/security-priorities': { title: 'Security Priorities', description: 'Review context-aware, evidence-backed security recommendations.' },
   '/quality': { title: 'Scan Quality', description: 'Learning-driven accuracy and tuning recommendations.' },
   '/profile': { title: 'Profile', description: 'Your account details and session information.' },
   '/enterprise': { title: 'Enterprise Workspace', description: 'Enterprise requests, approvals, and notifications.' },
@@ -167,8 +169,7 @@ function Sidebar({
         {navGroups.map((group) => {
           const items = group.items.filter(
             (item) => {
-              // Admin-only pages
-              const elevatedOnly = ['/code-analysis', '/brutal', '/private/dos', '/intelligence', '/attack-planner', '/quality'];
+              const elevatedOnly = ['/code-analysis', '/brutal', '/private/dos', '/intelligence', '/security-priorities', '/quality'];
               if (elevatedOnly.includes(item.path) && !hasElevatedAccess(user)) return false;
               if (item.path === '/enterprise' && !user?.enterpriseId) return false;
               return true;
@@ -319,7 +320,7 @@ function GlobalSearch() {
       ...assets
         .filter((asset) => `${asset.name} ${asset.target_url}`.toLowerCase().includes(needle))
         .slice(0, 3)
-        .map((asset) => ({ label: asset.name, detail: `${asset.findings.length} findings`, path: '/assets', icon: Layers3 })),
+        .map((asset) => ({ label: asset.name, detail: `${asset.findings_count} findings`, path: '/assets', icon: Layers3 })),
       ...scans
         .filter((scan) => `${scan.target_url} ${scan.mode} ${scan.status}`.toLowerCase().includes(needle))
         .slice(0, 3)

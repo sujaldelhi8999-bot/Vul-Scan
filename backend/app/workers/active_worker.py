@@ -42,7 +42,8 @@ async def execute(payload: dict[str, Any]) -> dict[str, Any]:
             transport=transport,
         )
         result = await engine.run()
-        return {"status": "complete", "result": result}
+        status = str(result.get("status") or "error")
+        return {"status": "complete" if status == "complete" else status, "result": result, "error": result.get("final_report")}
 
     authorization_service = TargetAuthorizationService()
     agent = PentestAgent(
@@ -61,7 +62,8 @@ async def execute(payload: dict[str, Any]) -> dict[str, Any]:
         selected_tests=[str(item) for item in payload["selected_tests"]],
         business_logic_tests=business_tests,
     )
-    return {"status": "complete", "result": result}
+    status = str(result.get("status") or "complete") if isinstance(result, dict) else "complete"
+    return {"status": "complete" if status == "complete" else status, "result": result}
 
 
 def main() -> None:
@@ -69,7 +71,7 @@ def main() -> None:
         payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
         result = asyncio.run(execute(payload))
         sys.stdout.write(json.dumps(result, separators=(",", ":")))
-    except BaseException as exc:
+    except Exception as exc:
         sys.stdout.write(json.dumps({"status": "error", "error": str(exc)}, separators=(",", ":")))
         raise SystemExit(1) from None
 

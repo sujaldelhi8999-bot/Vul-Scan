@@ -11,6 +11,7 @@ import PricingPage from './features/marketing/PricingPage';
 import DashboardPage from './features/dashboard/DashboardPage';
 import LiveScanPage from './features/scans/LiveScanPage';
 import FindingsPage from './features/findings/FindingsPage';
+import AttackPaths from './features/attack_paths/AttackPaths';
 import AssetsPage from './features/assets/AssetsPage';
 import CvePage from './features/cve/CvePage';
 import RemediationPage from './features/remediation/RemediationPage';
@@ -28,7 +29,7 @@ import AuthorizedTestingPage from './features/authorized-testing/AuthorizedTesti
 import ScanQualityPage from './features/learning/ScanQualityPage';
 import DoSPanel from './features/private/DoSPanel';
 import ReportPage from './features/reports/ReportPage';
-import AttackPlanner from './features/attack-planner/AttackPlanner';
+import SecurityPriorities from './features/attack-planner/AttackPlanner';
 import GitHubConnectPage from './features/github/GitHubConnectPage';
 import MultiSourceScanPage from './features/multi-source/MultiSourceScanPage';
 import MultiSourceDetailPage from './features/multi-source/MultiSourceDetailPage';
@@ -43,8 +44,8 @@ export default function App() {
     window.location.pathname === '/auth/callback' ||
     window.location.hash.startsWith('#/auth/callback') ||
     window.location.hash.includes('access_token=');
-  const workspace = (children: ReactNode, requiredTier?: 'FREE' | 'PRO' | 'ENTERPRISE', requireEnterprise = false) => (
-    <ProtectedRoute requiredTier={requiredTier} requireEnterprise={requireEnterprise}>
+  const workspace = (children: ReactNode, requiredTier?: 'FREE' | 'PRO' | 'ENTERPRISE', requireEnterprise = false, requireAdmin = false) => (
+    <ProtectedRoute requiredTier={requiredTier} requireEnterprise={requireEnterprise} requireAdmin={requireAdmin}>
       <AppShell>{children}</AppShell>
     </ProtectedRoute>
   );
@@ -72,6 +73,7 @@ export default function App() {
           <Route path="/dashboard" element={workspace(<DashboardPage />)} />
           <Route path="/scan" element={workspace(<LiveScanPage />)} />
           <Route path="/findings" element={workspace(<FindingsPage />)} />
+          <Route path="/attack-paths" element={workspace(<AttackPaths />)} />
           <Route path="/assets" element={workspace(<AssetsPage />)} />
           <Route path="/cve" element={workspace(<CvePage />)} />
           <Route path="/remediation" element={workspace(<RemediationPage />)} />
@@ -83,7 +85,8 @@ export default function App() {
           <Route path="/system-health" element={workspace(<SystemHealthPage />)} />
           <Route path="/settings" element={workspace(<SettingsPage />)} />
           <Route path="/intelligence" element={workspace(<AttackIntelligence />)} />
-          <Route path="/attack-planner" element={workspace(<AttackPlanner />)} />
+          <Route path="/security-priorities" element={workspace(<SecurityPriorities />)} />
+          <Route path="/attack-planner" element={<Navigate to="/security-priorities" replace />} />
           <Route path="/code-analysis" element={workspace(<CodeAnalysis />)} />
           <Route path="/brutal" element={workspace(<BrutalMode />)} />
           <Route path="/quality" element={workspace(<ScanQualityPage />)} />

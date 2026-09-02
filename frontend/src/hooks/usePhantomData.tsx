@@ -7,10 +7,10 @@ import {
   getFindings,
   getHealth,
   getLogs,
-  getScanArtifacts,
+  getScanArtifactsBatch,
   getScanHistory,
   getSelfAuditStatus,
-  getWebSocketUrl,
+  createAuthenticatedWebSocket,
   refreshSessionToken
 } from '../services/api';
 import type {
@@ -43,6 +43,7 @@ interface PhantomDataContextValue {
   refreshing: boolean;
   error: string | null;
   realtimeState: ConnectionState;
+  realtimeTick: number;
   realtimeHealthy: boolean;
   refresh: () => Promise<void>;
   executionStatus: ExecutionStatusResponse | null;
@@ -81,9 +82,11 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [realtimeState, setRealtimeState] = useState<ConnectionState>('idle');
+  const [realtimeTick, setRealtimeTick] = useState(0);
   const [executionStatus, setExecutionStatus] = useState<ExecutionStatusResponse | null>(null);
   const refreshInFlight = useRef(false);
   const execPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const artifactsRef = useRef<Record<number, ScanArtifactsResponse>>({});
 
   const [hasToken, setHasToken] = useState(() => !!localStorage.getItem('phantom_token'));
 
@@ -103,48 +106,56 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
     refreshInFlight.current = true;
     setRefreshing(true);
     try {
-      const requests = Promise.allSettled([
+      const requestList: Promise<unknown>[] = [
         getHealth(),
         getScanHistory(),
         getFindings(undefined, { limit: 100 }),
         getLogs(),
         getAgentStatuses(),
         getSelfAuditStatus()
-      ]);
+      ];
+      const requests: Promise<PromiseSettledResult<unknown>[]> = Promise.allSettled(requestList);
 
       const results = await withTimeout(requests, 8000);
 
       if (results) {
         const [healthResult, scansResult, findingsResult, logsResult, agentsResult, selfAuditResult] = results;
 
-        if (healthResult.status === 'fulfilled') setHealth(healthResult.value);
-        if (scansResult.status === 'fulfilled') setScans(scansResult.value);
-        if (findingsResult.status === 'fulfilled') setFindings(findingsResult.value);
-        if (logsResult.status === 'fulfilled') setLogs(logsResult.value);
-        if (agentsResult.status === 'fulfilled') setAgents(agentsResult.value);
-        if (selfAuditResult.status === 'fulfilled') setSelfAudit(selfAuditResult.value);
+        if (healthResult.status === 'fulfilled') setHealth(healthResult.value as HealthResponse);
+        let nextScans: ScanHistoryItem[] = [];
+        if (scansResult?.status === 'fulfilled') {
+          nextScans = scansResult.value as ScanHistoryItem[];
+          setScans(nextScans);
+        }
+        if (findingsResult?.status === 'fulfilled') setFindings(findingsResult.value as Finding[]);
+        if (logsResult?.status === 'fulfilled') setLogs(logsResult.value as AuditLog[]);
+        if (agentsResult?.status === 'fulfilled') setAgents(agentsResult.value as AgentStatus[]);
+        if (selfAuditResult?.status === 'fulfilled') setSelfAudit(selfAuditResult.value as SelfAuditStatusResponse);
 
-        const failures = [healthResult, scansResult, findingsResult, logsResult, agentsResult, selfAuditResult].filter(
+        const failures = results.filter(
           (result) => result.status === 'rejected'
         );
-        setError(failures.length ? 'Some VulScan backend data could not be refreshed.' : null);
-
-        const artifactScans = scansResult.status === 'fulfilled'
-          ? scansResult.value.filter((scan) => COMPLETED_STATUSES.has(scan.status)).slice(0, 8)
-          : scans.filter((scan) => COMPLETED_STATUSES.has(scan.status)).slice(0, 8);
-        const artifactResults = await withTimeout(
-          Promise.allSettled(artifactScans.map((scan) => getScanArtifacts(scan.id))),
-          5000
-        );
-        if (artifactResults) {
-          const nextArtifacts: Record<number, ScanArtifactsResponse> = {};
-          for (const result of artifactResults) {
-            if (result.status === 'fulfilled') {
-              nextArtifacts[result.value.scan_id] = result.value;
-            }
+        if (nextScans.length) {
+          const artifactScanIds = new Set(nextScans.slice(0, 10).map((scan) => scan.id));
+          const seenTargets = new Set<string>();
+          for (const scan of nextScans) {
+            const target = scan.target_url.trim().toLowerCase();
+            if (!target || seenTargets.has(target) || !COMPLETED_STATUSES.has(scan.status.toLowerCase())) continue;
+            seenTargets.add(target);
+            artifactScanIds.add(scan.id);
           }
-          setArtifactsByScanId((current) => ({ ...current, ...nextArtifacts }));
+          const artifactIds = Array.from(artifactScanIds).filter((id) => !artifactsRef.current[id]);
+          const artifactResults = artifactIds.length ? await withTimeout(getScanArtifactsBatch(artifactIds), 5000) : null;
+          setArtifactsByScanId((current) => {
+            const next = { ...current };
+            for (const [scanId, artifact] of Object.entries(artifactResults ?? {})) {
+              next[Number(scanId)] = artifact;
+            }
+            artifactsRef.current = next;
+            return next;
+          });
         }
+        setError(failures.length ? 'Some VulScan backend data could not be refreshed.' : null);
       } else {
         setError('Backend data refresh timed out. Check that the API is reachable.');
       }
@@ -189,7 +200,7 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
       }
       setRealtimeState('connecting');
       try {
-        socket = new WebSocket(getWebSocketUrl('/ws/status'));
+        socket = await createAuthenticatedWebSocket('/ws/status', 'status');
       } catch {
         setRealtimeState('error');
         reconnectAttempts += 1;
@@ -220,6 +231,7 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
           const parsed = JSON.parse(event.data) as Record<string, unknown>;
           const payload = typeof parsed.payload === 'object' && parsed.payload !== null ? parsed.payload : parsed;
           if (isHealthResponse(payload)) setHealth(payload);
+          setRealtimeTick((current) => current + 1);
         } catch {
           // Ignore malformed frames
         }
@@ -255,7 +267,7 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
         }
         setRealtimeState('closed');
         reconnectAttempts += 1;
-        reconnect = window.setTimeout(() => void connect(), Math.min(5000 * reconnectAttempts, 30000));
+        reconnect = window.setTimeout(() => void connect(), Math.min(1000 * 2 ** reconnectAttempts, 30000) + Math.floor(Math.random() * 500));
       };
     };
 
@@ -266,7 +278,7 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
       if (connectTimeout) window.clearTimeout(connectTimeout);
       socket?.close();
     };
-  }, []);
+  }, [hasToken]);
 
   const realtimeHealthy = realtimeState === 'open' && health?.status === 'ok';
 
@@ -314,7 +326,7 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
         execPollingRef.current = null;
       }
     };
-  }, [execActive]);
+  }, [hasToken, execActive]);
 
   useEffect(() => {
     const handleVisibility = () => {
@@ -347,6 +359,7 @@ export function PhantomDataProvider({ children }: { children: ReactNode }) {
         refreshing,
         error,
         realtimeState,
+        realtimeTick,
         realtimeHealthy,
         refresh: superRefresh,
         executionStatus,

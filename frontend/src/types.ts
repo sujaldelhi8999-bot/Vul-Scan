@@ -1,4 +1,5 @@
 export type ScanMode = 'defend' | 'pentest' | 'multi_agent';
+export type ScanDepth = 'quick' | 'standard' | 'deep' | 'stealth';
 export type ScanIntensity = 'low' | 'medium' | 'high';
 export type ScanStatus = 'queued' | 'running' | 'cancelling' | 'cancelled' | 'complete' | 'error';
 export type AgentState = 'idle' | 'active' | 'complete' | 'error';
@@ -50,11 +51,16 @@ export interface BusinessLogicTest {
 export interface ScanRequestPayload {
   target_url: string;
   mode: ScanMode;
+  scan_depth?: ScanDepth;
+  profile?: ScanDepth;
   intensity: ScanIntensity;
+  severity_filters?: Array<'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' | 'INFO'>;
   selected_tests?: TestModule[];
   authorization_id?: number | null;
   authorization_confirmed?: boolean;
   business_logic_tests?: BusinessLogicTest[];
+  confidence_profile?: 'strict' | 'balanced' | 'aggressive';
+  confidence_sensitivity?: 'strict' | 'balanced' | 'aggressive';
   enable_exploitation?: boolean;
   enable_ai_exploitation?: boolean;
   approval_request_id?: number;
@@ -92,6 +98,18 @@ export interface Finding {
   remediation_status?: RemediationStatus;
   verification_status?: FindingVerificationStatus;
   risk_status?: RiskStatus;
+  request_id?: string | null;
+  verified?: boolean;
+  confidence_percent?: number | null;
+  confidence_score?: number | null;
+  confidence_label?: string | null;
+  reproduction_command?: string | null;
+  request_response_diff?: string | null;
+  verification_hash?: string | null;
+  verification_method?: string | null;
+  verification_stage?: string | null;
+  verification_result?: Record<string, unknown> | null;
+  source_correlation?: Record<string, unknown> | null;
   exploited?: boolean;
   exploitation_result?: ExploitationResult | null;
 }
@@ -745,6 +763,81 @@ export interface AuditLog {
 export interface AgentStatus {
   name: string;
   status: AgentState;
+}
+
+export type AdminMeasurement<T = number> = {
+  status: 'measured' | 'not_measured' | string;
+  value: T | null;
+};
+
+export type AdminAgentStatus =
+  | 'IDLE'
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'WAITING'
+  | 'COMPLETED'
+  | 'COMPLETED_WITH_LIMITATIONS'
+  | 'FAILED'
+  | 'TIMED_OUT'
+  | 'CANCELLED'
+  | 'SKIPPED'
+  | 'UNKNOWN';
+
+export interface AdminAgent {
+  id: string;
+  name: string;
+  status: AdminAgentStatus;
+  scan_id: number | null;
+  runtime_seconds: number | null;
+  requests: number;
+  findings_generated: number;
+  candidates_rejected: AdminMeasurement | number | null;
+  errors: number;
+  timeouts: number;
+  last_execution: string | null;
+  average_runtime_seconds: AdminMeasurement | number | null;
+  yield_per_request: AdminMeasurement | number | null;
+  yield_per_runtime: AdminMeasurement | number | null;
+}
+
+export interface AdminOperation {
+  scan_id: number;
+  target: string;
+  owner: string | null;
+  mode: string | null;
+  profile: string | null;
+  status: string;
+  started_at: string | null;
+  elapsed_seconds: number | null;
+  progress: number;
+  request_count: number | null;
+  request_count_state: 'measured' | 'not_measured' | string;
+  endpoints_discovered: number;
+  parameters_discovered: number;
+  findings: number;
+  running_agent: string | null;
+  running_agents: string[];
+  completed_agents: string[];
+  failed_agents: string[];
+  timed_out_agents: string[];
+  provider_limitations: unknown[];
+  waf_state: string;
+  authenticated_state: string;
+  scan_quality: AdminMeasurement | Record<string, unknown>;
+}
+
+export interface AdminProvider {
+  name: string;
+  status: string;
+  configured: boolean | null;
+  last_failure: string | null;
+  last_success: string | null;
+  latency_ms: number | null;
+  circuit_breaker: string | null;
+}
+
+export interface AdminListResponse<T> {
+  items: T[];
 }
 
 export interface HealthResponse {

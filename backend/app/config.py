@@ -37,6 +37,8 @@ class Settings:
     cors_origins = list(dict.fromkeys([frontend_url, "http://localhost:5173", "http://127.0.0.1:5173"]))
     openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
     openrouter_model = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+    use_production_ai = os.getenv("USE_PRODUCTION_AI", "false").lower() in ("1", "true", "yes", "on")
+    ai_model = os.getenv("AI_MODEL", "google/gemma-4-31b-it:free" if not use_production_ai else "openai/gpt-5.5-mini")
     llm_provider = os.getenv("LLM_PROVIDER", "openrouter")
     llm_model = os.getenv("LLM_MODEL", "")
     llm_api_key = os.getenv("LLM_API_KEY", "")
@@ -58,11 +60,14 @@ class Settings:
     max_scan_duration = env_int("MAX_SCAN_DURATION", 900)
     max_requests_per_second = env_float("MAX_REQUESTS_PER_SECOND", 10.0)
     max_total_requests = env_int("MAX_TOTAL_REQUESTS", 5000)
+    active_max_concurrency = env_int("ACTIVE_MAX_CONCURRENCY", 20)
     max_concurrent_scans = env_int("MAX_CONCURRENT_SCANS", 10)
     max_redirect_depth = env_int("MAX_REDIRECT_DEPTH", 5)
     max_response_size = env_int("MAX_RESPONSE_SIZE", 1_048_576)
     browser_page_limit = env_int("BROWSER_PAGE_LIMIT", 16)
     module_timeout = env_int("MODULE_TIMEOUT", 120)
+    analysis_module_timeout = env_float("ANALYSIS_MODULE_TIMEOUT", 20.0)
+    nvd_lookup_timeout = env_float("NVD_LOOKUP_TIMEOUT", 10.0)
     active_target_allowlist = os.getenv("ACTIVE_TARGET_ALLOWLIST", "")
     deep_port_scan_enabled = os.getenv("DEEP_PORT_SCAN", "1") not in ("0", "false", "False")
     port_scan_concurrency = env_int("PORT_SCAN_CONCURRENCY", 64)
@@ -153,6 +158,25 @@ class Settings:
     ml_severity_override = env_bool("ML_SEVERITY_OVERRIDE", False)
     ml_fp_auto_filter = env_bool("ML_FP_AUTO_FILTER", False)
 
+    # Stealth / evasion scanning
+    stealth_enabled = env_bool("STEALTH_ENABLED", True)
+    proxy_list_raw = os.getenv("PROXY_LIST", "")
+    headless_browser = env_bool("HEADLESS_BROWSER", False)
+    evasion_max_attempts = env_int("EVASION_MAX_ATTEMPTS", 3)
+    evasion_delay_min = env_float("EVASION_DELAY_MIN", 0.5)
+    evasion_delay_max = env_float("EVASION_DELAY_MAX", 2.0)
+    evasion_header_injection = env_bool("EVASION_HEADER_INJECTION", True)
+    evasion_path_transforms = env_bool("EVASION_PATH_TRANSFORMS", True)
+    evasion_max_path_variants = env_int("EVASION_MAX_PATH_VARIANTS", 6)
+
+    # Verified finding precision thresholds. These tune how numeric verifier
+    # scores become analyst-facing confidence labels.
+    confidence_high = env_float("CONFIDENCE_HIGH", 0.85)
+    confidence_medium = env_float("CONFIDENCE_MEDIUM", 0.60)
+    callback_domain = os.getenv("CALLBACK_DOMAIN", "")
+    callback_base_url = os.getenv("CALLBACK_BASE_URL", "")
+    callback_wait_timeout = env_float("CALLBACK_WAIT_TIMEOUT", 5.0)
+
     def validate_required(self, mode: str = "defend") -> list[str]:
         """Validate required settings for a given scan mode. Returns list of missing keys."""
         missing = []
@@ -168,3 +192,16 @@ class Settings:
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def get_model() -> str:
+    """Return the AI model to use based on configuration.
+    
+    If USE_PRODUCTION_AI is true, returns the PRODUCTION_MODEL.
+    Otherwise returns the DEV_MODEL (Nemotron 3.5 Lightning).
+    """
+    from app.config import get_settings as _gs
+    settings = _gs()
+    if settings.use_production_ai:
+        return settings.ai_model or "openai/gpt-5.5-mini"
+    return settings.ai_model or "google/gemma-4-31b-it:free"

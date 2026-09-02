@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from app.services.inline_scanner import InlineScanner
+from app.services.regex_scanner import RegexFallbackScanner
 from app.services.rule_scanner import RuleScanner
 
 
@@ -72,6 +74,53 @@ class TestRuleScanner(unittest.TestCase):
                 any("USER" in t.upper() or "root" in t.lower() or "healthcheck" in t.lower() for t in titles),
                 f"Expected Docker finding, got: {titles}"
             )
+
+    def test_weak_crypto_rules_ignore_text_and_match_crypto_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prose = root / "app.ts"
+            prose.write_text(
+                "const description = 'This description mentions DES and MD5 in documentation only';\n"
+                "// DES.new(key) and hashlib.md5() are examples in comments\n"
+            )
+            crypto = root / "crypto.py"
+            crypto.write_text(
+                "from Crypto.Cipher import DES3\n"
+                "cipher = DES3.new(key, DES3.MODE_CBC, iv)\n"
+                "digest = hashlib.md5(payload).hexdigest()\n"
+            )
+            import asyncio
+            results = asyncio.run(self.scanner.scan(tmp))
+
+            prose_results = [item for item in results if item["file_path"] == "app.ts"]
+            crypto_rule_ids = {item["rule_id"] for item in results if item["file_path"] == "crypto.py"}
+            self.assertFalse(any(item["rule_id"] == "sec-weak-crypto-des" for item in prose_results), prose_results)
+            self.assertFalse(any(item["rule_id"] == "sec-weak-crypto-md5" for item in prose_results), prose_results)
+            self.assertIn("sec-weak-crypto-des", crypto_rule_ids)
+            self.assertIn("sec-weak-crypto-md5", crypto_rule_ids)
+
+    def test_exclude_patterns_apply_to_rule_inline_and_regex_scanners(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs = root / "docs"
+            docs.mkdir()
+            (docs / "README.md").write_text("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n")
+            src = root / "src"
+            src.mkdir()
+            (src / "settings.ts").write_text("const awsKey = 'AKIAIOSFODNN7EXAMPLE';\n")
+            excludes = ["**/*.md", "docs/**"]
+
+            import asyncio
+            rule_results = asyncio.run(self.scanner.scan(tmp, exclude_patterns=excludes))
+            inline_results = asyncio.run(InlineScanner().scan(tmp, exclude_patterns=excludes)).findings
+            regex_results = asyncio.run(RegexFallbackScanner().scan(tmp, exclude_patterns=excludes)).findings
+
+            self.assertTrue(rule_results)
+            self.assertTrue(inline_results)
+            self.assertTrue(regex_results)
+            self.assertFalse(any("README.md" in item["file_path"] for item in rule_results))
+            self.assertFalse(any("README.md" in item.file_path for item in inline_results))
+            self.assertFalse(any("README.md" in item.file_path for item in regex_results))
 
 
 if __name__ == "__main__":

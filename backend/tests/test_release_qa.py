@@ -1,14 +1,10 @@
 import asyncio
 import json
 import os
-import tempfile
 from datetime import datetime, timezone
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import patch
 
-_db_fd, _db_path = tempfile.mkstemp(suffix=".release-qa.sqlite3")
-os.close(_db_fd)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 os.environ.setdefault("MAX_TOTAL_REQUESTS", "90")
 os.environ.setdefault("MAX_REQUESTS_PER_SECOND", "100")
 

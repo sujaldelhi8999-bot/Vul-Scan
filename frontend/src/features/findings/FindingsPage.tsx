@@ -13,7 +13,6 @@ import {
   PageHeader,
   Panel,
   RemediationChecklist,
-  SectionHeader,
   Select,
   SeverityBadge,
   StatusBadge,
@@ -34,11 +33,6 @@ import { AITutorChat } from './AITutorChat';
 function checklist(finding: Finding) {
   const fix = finding.fix_recommendation || finding.recommended_fix || finding.recommendation || finding.fix || 'Review and remediate this finding.';
   return fix.split(/\n|\.\s+/).map((item) => item.trim().replace(/^[-*\d.)\s]+/, '')).filter(Boolean).slice(0, 6);
-}
-
-function text(value: unknown, fallback = 'Not available'): string {
-  if (value === null || value === undefined || value === '') return fallback;
-  return typeof value === 'string' ? value : String(value);
 }
 
 function sameId(value: unknown, id: number): boolean {
@@ -65,7 +59,6 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
   const [action, setAction] = useState<string | null>(null);
   const analyst = finding ? artifactsByScanId[finding.scan_id]?.ai_analyst_output : null;
   const priority = finding ? analyst?.priorities?.find((item) => sameId(item.finding_id, finding.id)) : undefined;
-  const developerAnalysis = finding ? analyst?.developer_report?.find((item) => sameId(item.finding_id, finding.id)) : undefined;
   const relatedChains = finding ? relatedChainsFor(analyst, finding.id) : [];
   const planItems = finding ? remediationPlanFor(analyst, finding.id) : [];
 
@@ -76,8 +69,11 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
       await updateFindingRemediation(finding.id, 'IN_PROGRESS');
       toast.success('Marked in progress');
       await refresh();
-    } catch (err) { toast.error(apiErrorMessage(err, 'Unable to update.')); }
-    finally { setAction(null); }
+    } catch (err) {
+      toast.error(apiErrorMessage(err, 'Unable to update.'));
+    } finally {
+      setAction(null);
+    }
   };
 
   const verifyFixAction = async () => {
@@ -87,8 +83,11 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
       const result = await verifyFindingFix(finding.id);
       toast.success(result.status === 'FIX_VERIFIED' ? 'Fix verified' : 'Still present');
       await refresh();
-    } catch (err) { toast.error(apiErrorMessage(err, 'Unable to verify.')); }
-    finally { setAction(null); }
+    } catch (err) {
+      toast.error(apiErrorMessage(err, 'Unable to verify.'));
+    } finally {
+      setAction(null);
+    }
   };
 
   const updateRisk = async (riskStatus: RiskStatus) => {
@@ -98,8 +97,11 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
       await updateFindingRiskStatus(finding.id, riskStatus);
       toast.success(riskStatus === 'ACTIVE' ? 'Reactivated' : 'Excluded');
       await refresh();
-    } catch (err) { toast.error(apiErrorMessage(err, 'Unable to update.')); }
-    finally { setAction(null); }
+    } catch (err) {
+      toast.error(apiErrorMessage(err, 'Unable to update.'));
+    } finally {
+      setAction(null);
+    }
   };
 
   const requestChange = async () => {
@@ -142,15 +144,13 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
             <StatusBadge status={finding.confidence} />
           </div>
 
-          {/* Overview */}
           <div className="rounded-xl bg-[var(--surface-secondary)] p-3.5">
-            <h3 className="text-xs font-semibold text-[var(--text-strong)] mb-1">Overview</h3>
+            <h3 className="mb-1 text-xs font-semibold text-[var(--text-strong)]">Overview</h3>
             <p className="text-xs leading-relaxed text-[var(--text-muted)]">
               {finding.description || finding.evidence || 'No overview persisted.'}
             </p>
           </div>
 
-          {/* Details grid */}
           <div className="grid grid-cols-2 gap-2">
             {[
               ['Asset', targetName(finding.target)],
@@ -169,51 +169,48 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
             ))}
           </div>
 
-          {/* Source Location */}
-          {(finding.file_path || finding.line_number) && (
+          {(finding.file_path || finding.line_number) ? (
             <div className="rounded-xl bg-[var(--surface-secondary)] p-3.5">
-              <h3 className="text-xs font-semibold text-[var(--text-strong)] mb-1">Source Location</h3>
+              <h3 className="mb-1 text-xs font-semibold text-[var(--text-strong)]">Source Location</h3>
               <div className="flex flex-wrap gap-3 text-xs text-[var(--text-default)]">
-                {finding.file_path && (
-                  <span className="font-mono break-all">
+                {finding.file_path ? (
+                  <span className="break-all font-mono">
                     <span className="text-[var(--text-subtle)]">File:</span> {finding.file_path}
                   </span>
-                )}
-                {finding.line_number && (
+                ) : null}
+                {finding.line_number ? (
                   <span className="font-mono">
                     <span className="text-[var(--text-subtle)]">Line:</span> {finding.line_number}
                   </span>
-                )}
+                ) : null}
               </div>
             </div>
-          )}
+          ) : null}
 
-          {/* Code Snippet */}
-          {finding.code_snippet && (
+          {finding.code_snippet ? (
             <div>
               <h3 className="mb-1.5 text-xs font-semibold text-[var(--text-strong)]">Code Snippet</h3>
-              <pre className="whitespace-pre-wrap rounded-xl bg-[var(--surface-tertiary)] p-3.5 font-mono text-[11px] text-[var(--text-default)] max-h-48 overflow-y-auto">
+              <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded-xl bg-[var(--surface-tertiary)] p-3.5 font-mono text-[11px] text-[var(--text-default)]">
                 {finding.code_snippet}
               </pre>
             </div>
-          )}
+          ) : null}
 
-          {/* Exploitation Result */}
           {finding.exploited && finding.exploitation_result ? (
             <div className="rounded-xl border border-green-500/30 bg-green-500/10 p-3.5">
               <h3 className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-green-600 dark:text-green-400">
                 <Database className="h-3.5 w-3.5" /> Exploitation Result
               </h3>
               <div className="space-y-2 text-xs">
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   <span className="font-medium text-[var(--text-strong)]">Database:</span>
                   <span className="text-[var(--text-default)]">{finding.exploitation_result.database_type || 'Unknown'}</span>
                   <span className="font-medium text-[var(--text-strong)]">Status:</span>
-                  <span className={`${finding.exploitation_result.status === 'completed' ? 'text-green-600' : 'text-red-600'}`}>
+                  <span className={finding.exploitation_result.status === 'completed' ? 'text-green-600' : 'text-red-600'}>
                     {finding.exploitation_result.status}
                   </span>
                 </div>
-                {finding.exploitation_result.tables && finding.exploitation_result.tables.length > 0 ? (
+                {finding.exploitation_result.tables?.length ? (
                   <div>
                     <span className="font-medium text-[var(--text-strong)]">Tables ({finding.exploitation_result.tables.length}):</span>{' '}
                     <span className="text-[var(--text-default)]">{finding.exploitation_result.tables.join(', ')}</span>
@@ -221,8 +218,8 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
                 ) : null}
                 {finding.exploitation_result.data?.map((td: ExploitationResultData) => (
                   <div key={td.table} className="rounded-lg bg-[var(--surface-tertiary)] p-2.5">
-                    <div className="mb-1 font-medium text-[var(--text-strong)]">📊 {td.table}</div>
-                    {td.rows && td.rows.length > 0 ? (
+                    <div className="mb-1 font-medium text-[var(--text-strong)]">{td.table}</div>
+                    {td.rows?.length ? (
                       <pre className="overflow-auto whitespace-pre-wrap font-mono text-[10px] text-[var(--text-muted)]">
                         {JSON.stringify(td.rows, null, 2)}
                       </pre>
@@ -231,14 +228,11 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
                     )}
                   </div>
                 ))}
-                {finding.exploitation_result.error ? (
-                  <div className="text-red-500">Error: {finding.exploitation_result.error}</div>
-                ) : null}
+                {finding.exploitation_result.error ? <div className="text-red-500">Error: {finding.exploitation_result.error}</div> : null}
               </div>
             </div>
           ) : null}
 
-          {/* Evidence */}
           <div>
             <h3 className="mb-1.5 text-xs font-semibold text-[var(--text-strong)]">Evidence</h3>
             <pre className="whitespace-pre-wrap rounded-xl bg-[var(--surface-tertiary)] p-3.5 font-mono text-[11px] text-[var(--text-default)]">
@@ -246,70 +240,59 @@ function FindingDrawer({ finding, onClose }: { finding: Finding | null; onClose:
             </pre>
           </div>
 
-          {/* Risk */}
+          {finding.reproduction_command ? (
+            <div>
+              <h3 className="mb-1.5 text-xs font-semibold text-[var(--text-strong)]">PoC Command</h3>
+              <pre className="whitespace-pre-wrap rounded-xl bg-[var(--surface-tertiary)] p-3.5 font-mono text-[11px] text-[var(--text-default)]">
+                {finding.reproduction_command}
+              </pre>
+            </div>
+          ) : null}
+
+          {finding.request_response_diff ? (
+            <div>
+              <h3 className="mb-1.5 text-xs font-semibold text-[var(--text-strong)]">Request / Response Diff</h3>
+              <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded-xl bg-[var(--surface-tertiary)] p-3.5 font-mono text-[11px] text-[var(--text-default)]">
+                {finding.request_response_diff}
+              </pre>
+            </div>
+          ) : null}
+
+          {relatedChains.length || planItems.length ? (
+            <div>
+              <h3 className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-[var(--text-strong)]">
+                <Sparkles className="h-3.5 w-3.5 text-[var(--brand)]" /> AI Security Analyst
+              </h3>
+              <div className="space-y-2 text-xs text-[var(--text-muted)]">
+                {priority ? <div>Priority #{priority.priority} with score {priority.score}.</div> : null}
+                {relatedChains.length ? <div>{relatedChains.length} related attack chain(s) reference this finding.</div> : null}
+                {planItems.length ? <div>{planItems.length} remediation plan item(s) apply.</div> : null}
+              </div>
+            </div>
+          ) : null}
+
           <div className="rounded-xl border border-[var(--danger-soft)] bg-[var(--danger-soft)]/30 p-3.5">
-            <h3 className="text-xs font-semibold text-[var(--danger)] mb-1">Risk / Impact</h3>
+            <h3 className="mb-1 text-xs font-semibold text-[var(--danger)]">Risk / Impact</h3>
             <p className="text-xs leading-relaxed text-[var(--text-default)]">
               {finding.impact || finding.how_exploited || 'Not persisted.'}
             </p>
           </div>
 
-          {/* AI Explanation */}
           <div>
-            <h3 className="text-xs font-semibold text-[var(--text-strong)] mb-1.5">AI Explanation</h3>
-            <p className="whitespace-pre-wrap text-xs leading-relaxed text-[var(--text-muted)]">
-              {finding.how_exploited || finding.impact || 'Not persisted.'}
-            </p>
-          </div>
-
-          {/* AI Tutor Chat */}
-          <div>
+            <h3 className="mb-1.5 text-xs font-semibold text-[var(--text-strong)]">AI Tutor</h3>
             <AITutorChat finding={finding} />
           </div>
 
-          {/* AI Security Analyst */}
-          {analyst ? (
-            <div>
-              <h3 className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-[var(--text-strong)]">
-                <Sparkles className="h-3.5 w-3.5 text-[var(--brand)]" />AI Security Analyst
-              </h3>
-              <div className="space-y-2">
-                <div className="grid grid-cols-3 gap-2">
-                  <div className="rounded-lg bg-[var(--surface-secondary)] p-2.5">
-                    <div className="text-[10px] text-[var(--text-muted)]">Priority</div>
-                    <div className="mt-0.5 text-sm font-semibold text-[var(--text-strong)]">{priority ? `#${priority.priority}` : '--'}</div>
-                  </div>
-                  <div className="rounded-lg bg-[var(--surface-secondary)] p-2.5">
-                    <div className="text-[10px] text-[var(--text-muted)]">Score</div>
-                    <div className="mt-0.5 text-sm font-semibold text-[var(--text-strong)]">{priority?.score ?? '--'}</div>
-                  </div>
-                  <div className="rounded-lg bg-[var(--surface-secondary)] p-2.5">
-                    <div className="text-[10px] text-[var(--text-muted)]">Active Tests</div>
-                    <div className="mt-0.5 text-xs text-[var(--text-default)]">{analyst.safety?.can_start_active_test === false ? 'Disabled' : 'N/A'}</div>
-                  </div>
-                </div>
-                {priority?.factors?.length ? (
-                  <div className="flex flex-wrap gap-1">
-                    {priority.factors.map((factor) => (<StatusBadge key={factor} status={factor} />))}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
-
-          {/* Remediation */}
           <div className="rounded-xl border border-[var(--brand-soft)] bg-[var(--brand-soft)]/30 p-3.5">
-            <h3 className="text-xs font-semibold text-[var(--brand)] mb-1.5">Recommended Fix</h3>
+            <h3 className="mb-1.5 text-xs font-semibold text-[var(--brand)]">Recommended Fix</h3>
             <RemediationChecklist items={checklist(finding)} />
           </div>
 
-          {/* Verification */}
           <div>
             <h3 className="mb-1 text-xs font-semibold text-[var(--text-strong)]">Verification</h3>
             <p className="text-xs text-[var(--text-muted)]">{finding.verification || 'Rerun the relevant check after remediation.'}</p>
           </div>
 
-          {/* Actions */}
           <div>
             <h3 className="mb-2 text-xs font-semibold text-[var(--text-strong)]">Actions</h3>
             <div className="grid grid-cols-2 gap-2">
@@ -408,8 +391,8 @@ export default function FindingsPage() {
 
   return (
     <Page>
-        <PageHeader
-          title="Findings"
+      <PageHeader
+        title="Findings"
         description={`${total} total findings across all scans`}
         action={
           <div className="relative w-56">
@@ -419,7 +402,6 @@ export default function FindingsPage() {
         }
       />
 
-      {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex gap-1">
           {['ALL', ...severityOrder].map((s) => (
@@ -439,7 +421,6 @@ export default function FindingsPage() {
         </Select>
       </div>
 
-      {/* Findings table */}
       <Panel>
         {loading ? (
           <div className="p-5 text-xs text-[var(--text-muted)]">Loading findings...</div>
@@ -452,10 +433,9 @@ export default function FindingsPage() {
                 Loading details for {selectedSummary.title}...
               </div>
             ) : null}
-            {/* Desktop table */}
             <div className="hidden md:block">
               <div
-                className="grid gap-3 border-b border-[var(--border-light)] bg-[var(--surface-secondary)] px-4 py-2.5 text-[11px] font-semibold text-[var(--text-muted)] tracking-wide"
+                className="grid gap-3 border-b border-[var(--border-light)] bg-[var(--surface-secondary)] px-4 py-2.5 text-[11px] font-semibold tracking-wide text-[var(--text-muted)]"
                 style={{ gridTemplateColumns: '80px 1.5fr 1fr 120px 85px 100px' }}
               >
                 <span>Severity</span><span>Finding</span><span>Asset</span><span>Category</span><span>Status</span><span>Detected</span>
@@ -479,7 +459,6 @@ export default function FindingsPage() {
               </div>
             </div>
 
-            {/* Mobile cards */}
             <div className="space-y-2 p-4 md:hidden">
               {findings.map((finding) => (
                 <button key={finding.id} onClick={() => openFinding(finding)} className="w-full rounded-xl border border-[var(--border-light)] p-3.5 text-left">

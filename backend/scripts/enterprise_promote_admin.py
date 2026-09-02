@@ -107,10 +107,9 @@ async def _run_promote(email: str, name: str | None, domains: list[str]) -> dict
     try:
         return await promote(email, name, domains)
     finally:
-        from app import database
+        from app.database import close_database
 
-        if database._db_connection is not None:
-            await database._db_connection.close()
+        await close_database()
 
 
 def _parser() -> argparse.ArgumentParser:

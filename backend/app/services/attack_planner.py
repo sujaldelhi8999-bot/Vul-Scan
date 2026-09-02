@@ -60,6 +60,27 @@ class AttackStep:
     prerequisites: list[str]
     mitigations: list[str]
     references: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
+    vulnerability_type: str = ""
+    category: str = "general"
+    priority: int = 5
+    context_reason: str = ""
+
+
+@dataclass
+class AttackContext:
+    parameters: list[str] = field(default_factory=list)
+    forms: list[dict[str, Any]] = field(default_factory=list)
+    api_endpoints: list[str] = field(default_factory=list)
+    graphql_endpoints: list[str] = field(default_factory=list)
+    file_uploads: list[str] = field(default_factory=list)
+    auth_endpoints: list[str] = field(default_factory=list)
+    redirect_parameters: list[str] = field(default_factory=list)
+    debug_endpoints: list[str] = field(default_factory=list)
+    discovered_paths: list[str] = field(default_factory=list)
+    real_findings: list[dict[str, Any]] = field(default_factory=list)
+    technologies: list[str] = field(default_factory=list)
+    response_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -764,6 +785,7 @@ class AttackPlanner:
         tech_stack: dict[str, Any] | None = None,
         open_ports: list[int] | None = None,
         findings: list[dict[str, Any]] | None = None,
+        entry_points: list[dict[str, Any]] | None = None,
     ) -> AttackPlan:
         """Generate a comprehensive attack plan for a target."""
         parsed = urlparse(target_url)
@@ -775,6 +797,8 @@ class AttackPlanner:
             tech_stack = await self._detect_tech_stack(target_url)
 
         stack = self._parse_tech_stack(tech_stack)
+        context = await self._build_context(target_url, stack, scan_id=scan_id, findings=findings, entry_points=entry_points)
+        findings = context.real_findings
 
         # Build attack steps
         steps: list[AttackStep] = []
@@ -787,8 +811,10 @@ class AttackPlanner:
         )
         for tech in all_tech:
             tech_lower = tech.lower().strip()
+            tech_key = re.sub(r"[^a-z0-9]", "", tech_lower)
             for known_tech, attacks in ATTACK_KB.items():
-                if known_tech in tech_lower or tech_lower in known_tech:
+                known_key = re.sub(r"[^a-z0-9]", "", known_tech)
+                if known_tech in tech_lower or tech_lower in known_tech or known_key in tech_key or tech_key in known_key:
                     for attack_def in attacks:
                         step = self._build_step(step_id, attack_def, target_url, host, domain)
                         steps.append(step)
@@ -824,15 +850,7 @@ class AttackPlanner:
                     steps.append(step)
                     step_id += 1
 
-        # Deduplicate by attack name
-        seen = set()
-        unique_steps = []
-        for step in steps:
-            key = step.attack
-            if key not in seen:
-                seen.add(key)
-                unique_steps.append(step)
-        steps = unique_steps
+        steps = self._filter_contextual_steps(steps, context, host)
 
         # Re-number
         for i, step in enumerate(steps, 1):
@@ -843,7 +861,7 @@ class AttackPlanner:
             target=target_url,
             tech_stack=tech_stack,
             attack_steps=[self._step_to_dict(s) for s in steps],
-            summary=self._build_summary(steps, stack),
+            summary=self._build_summary(steps, stack, context),
             recommended_chain=self._recommend_chain(steps),
         )
         return plan
@@ -1019,7 +1037,367 @@ class AttackPlanner:
             modules=attack_def.get("modules", []),
             prerequisites=attack_def.get("prerequisites", []),
             mitigations=attack_def.get("mitigations", []),
+            requires=list(attack_def.get("requires") or self._infer_requires(attack_def)),
+            vulnerability_type=str(attack_def.get("vulnerability_type") or self._infer_vulnerability_type(attack_def)),
+            category=str(attack_def.get("category") or self._infer_category(attack_def)),
+            priority=int(attack_def.get("priority") or attack_def.get("default_priority") or 5),
+            context_reason=str(attack_def.get("context_reason") or ""),
         )
+
+    async def _build_context(
+        self,
+        target_url: str,
+        stack: TechStack,
+        *,
+        scan_id: int | None,
+        findings: list[dict[str, Any]] | None,
+        entry_points: list[dict[str, Any]] | None,
+    ) -> AttackContext:
+        context = AttackContext(
+            real_findings=self._dedupe_real_findings(findings or []),
+            technologies=[item.lower() for item in (stack.frameworks + stack.servers + stack.languages + stack.databases + stack.cms + stack.cloud + stack.cdn)],
+        )
+        self._merge_entry_points(context, entry_points or [])
+        if scan_id:
+            await self._merge_scan_context(context, scan_id)
+        if not any([context.parameters, context.forms, context.api_endpoints, context.graphql_endpoints, context.file_uploads, context.auth_endpoints, context.discovered_paths]):
+            await self._detect_entry_points(target_url, context)
+        parsed = urlparse(target_url)
+        for name in re.findall(r"[?&]([A-Za-z_][A-Za-z0-9_-]*)=", parsed.query):
+            self._append_unique(context.parameters, name)
+            if name.lower() in {"next", "redirect", "return", "returnurl", "url", "continue"}:
+                self._append_unique(context.redirect_parameters, name)
+        return context
+
+    async def _merge_scan_context(self, context: AttackContext, scan_id: int) -> None:
+        try:
+            from app.database import get_findings, get_scan_artifacts
+
+            context.real_findings = self._dedupe_real_findings(context.real_findings + await get_findings(scan_id))
+            artifacts = await get_scan_artifacts(scan_id) or {}
+        except Exception:
+            return
+        for key in ("active_security_output", "browser_security_output", "shadow_recon_output", "scanner_output"):
+            payload = artifacts.get(key) or {}
+            if isinstance(payload, str):
+                continue
+            surfaces = payload.get("surfaces") or payload.get("attack_surface", {}).get("surfaces") or payload.get("api_inventory") or []
+            if isinstance(surfaces, list):
+                self._merge_entry_points(context, [item for item in surfaces if isinstance(item, dict)])
+            for finding in payload.get("findings") or []:
+                if isinstance(finding, dict):
+                    context.real_findings = self._dedupe_real_findings(context.real_findings + [finding])
+
+    async def _detect_entry_points(self, target_url: str, context: AttackContext) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0, verify=False, follow_redirects=True, trust_env=False) as client:
+                response = await client.get(target_url, headers={"User-Agent": "PhantomScan-AttackPlanner/1.0"})
+        except Exception as exc:
+            logger.debug("Entry-point detection failed: %s", exc)
+            return
+        body = response.text[:200_000]
+        context.response_headers = {key.lower(): value for key, value in response.headers.items()}
+        for match in re.finditer(r"<form\b([^>]*)>(.*?)</form>", body, flags=re.IGNORECASE | re.DOTALL):
+            attrs = match.group(1)
+            inner = match.group(2)
+            action = self._attr(attrs, "action") or urlparse(target_url).path or "/"
+            method = (self._attr(attrs, "method") or "GET").upper()
+            form = {"type": "form", "path": action, "method": method, "parameters": []}
+            for input_match in re.finditer(r"<(?:input|textarea|select)\b([^>]*)>", inner, flags=re.IGNORECASE):
+                input_attrs = input_match.group(1)
+                name = self._attr(input_attrs, "name")
+                input_type = (self._attr(input_attrs, "type") or "").lower()
+                if name:
+                    self._append_unique(form["parameters"], name)
+                    self._append_unique(context.parameters, name)
+                if input_type == "file":
+                    self._append_unique(context.file_uploads, action)
+            context.forms.append(form)
+            if re.search(r"login|auth|signin|password", action + " " + inner, re.IGNORECASE):
+                self._append_unique(context.auth_endpoints, action)
+        for href in re.findall(r"(?:href|src)=['\"]([^'\"]+)['\"]", body, flags=re.IGNORECASE):
+            path = urlparse(href).path or href
+            if not path or path.startswith(("#", "mailto:")):
+                continue
+            self._append_unique(context.discovered_paths, path)
+            lowered = path.lower()
+            if "/api" in lowered:
+                self._append_unique(context.api_endpoints, path)
+            if "graphql" in lowered:
+                self._append_unique(context.graphql_endpoints, path)
+            if re.search(r"login|auth|signin", lowered):
+                self._append_unique(context.auth_endpoints, path)
+            if re.search(r"actuator|debug|env|trace|metrics", lowered):
+                self._append_unique(context.debug_endpoints, path)
+        for name in re.findall(r"[?&]([A-Za-z_][A-Za-z0-9_-]*)=", body):
+            self._append_unique(context.parameters, name)
+            if name.lower() in {"next", "redirect", "return", "returnurl", "url", "continue"}:
+                self._append_unique(context.redirect_parameters, name)
+
+    def _merge_entry_points(self, context: AttackContext, entry_points: list[dict[str, Any]]) -> None:
+        for endpoint in entry_points:
+            parameters = endpoint.get("parameters") or endpoint.get("params") or []
+            if isinstance(parameters, dict):
+                parameters = list(parameters.keys())
+            for parameter in parameters if isinstance(parameters, list) else []:
+                name = str(parameter.get("name") if isinstance(parameter, dict) else parameter)
+                if name:
+                    self._append_unique(context.parameters, name)
+                    if name.lower() in {"next", "redirect", "return", "returnurl", "url", "continue"}:
+                        self._append_unique(context.redirect_parameters, name)
+            path = str(endpoint.get("path") or endpoint.get("url") or endpoint.get("endpoint") or "")
+            method = str(endpoint.get("method") or "GET").upper()
+            endpoint_type = str(endpoint.get("type") or "").lower()
+            if path:
+                self._append_unique(context.discovered_paths, path)
+            lowered = f"{endpoint_type} {path}".lower()
+            if "api" in lowered or endpoint.get("module") == "api_security":
+                self._append_unique(context.api_endpoints, path or endpoint_type)
+            if "graphql" in lowered:
+                self._append_unique(context.graphql_endpoints, path or "/graphql")
+            if endpoint_type == "upload" or "upload" in lowered or "multipart" in str(endpoint).lower():
+                self._append_unique(context.file_uploads, path or "upload")
+            if method == "POST" or endpoint_type == "form":
+                context.forms.append(endpoint)
+            if re.search(r"login|auth|signin|password", lowered):
+                self._append_unique(context.auth_endpoints, path or endpoint_type)
+            if re.search(r"actuator|debug|env|trace|metrics", lowered):
+                self._append_unique(context.debug_endpoints, path or endpoint_type)
+
+    @staticmethod
+    def _attr(attrs: str, name: str) -> str:
+        match = re.search(rf"\b{name}\s*=\s*(['\"])(.*?)\1", attrs, flags=re.IGNORECASE)
+        return match.group(2).strip() if match else ""
+
+    @staticmethod
+    def _append_unique(values: list[Any], value: Any) -> None:
+        if value and value not in values:
+            values.append(value)
+
+    def _filter_contextual_steps(self, steps: list[AttackStep], context: AttackContext, host: str) -> list[AttackStep]:
+        filtered: list[AttackStep] = []
+        by_key: dict[str, AttackStep] = {}
+        for step in steps:
+            if not self._is_applicable(step, context):
+                continue
+            self._apply_priority_and_reason(step, context)
+            key = f"{step.vulnerability_type or step.attack.lower()}|{host}"
+            existing = by_key.get(key)
+            if existing is None or self._step_rank(step) > self._step_rank(existing):
+                by_key[key] = step
+        filtered = list(by_key.values())
+        filtered.sort(key=self._step_rank, reverse=True)
+        return filtered
+
+    def _is_applicable(self, step: AttackStep, context: AttackContext) -> bool:
+        if step.vulnerability_type in {"hsts", "tls"} and not self._matching_real_finding(step, context):
+            return False
+        if self._matching_real_finding(step, context):
+            return True
+        for requirement in step.requires:
+            if requirement == "parameters" and not context.parameters:
+                return False
+            if requirement == "redirect" and not context.redirect_parameters:
+                return False
+            if requirement == "forms" and not context.forms:
+                return False
+            if requirement == "file_upload" and not context.file_uploads:
+                return False
+            if requirement == "api" and not context.api_endpoints:
+                return False
+            if requirement == "graphql" and not context.graphql_endpoints and not any("graphql" in item for item in context.technologies):
+                return False
+            if requirement == "auth" and not context.auth_endpoints:
+                return False
+            if requirement == "cors_headers" and not any(header.startswith("access-control-") for header in context.response_headers):
+                return False
+            if requirement == "debug_endpoint" and not context.debug_endpoints:
+                return False
+            if requirement == "database" and not any(db in " ".join(context.technologies) for db in ["mysql", "postgres", "sqlite", "mssql", "oracle", "mongodb"]):
+                return False
+            if requirement == "server_side" and not self._has_server_side_context(context):
+                return False
+            if requirement == "cloud" and not any(cloud in " ".join(context.technologies) for cloud in ["aws", "gcp", "azure", "vercel", "cloudflare", "cloudfront"]):
+                return False
+        return True
+
+    @staticmethod
+    def _has_server_side_context(context: AttackContext) -> bool:
+        text = " ".join(context.technologies)
+        return any(token in text for token in ["django", "flask", "laravel", "spring", "rails", "express", "php", "node", "python", "java", "ruby"])
+
+    def _apply_priority_and_reason(self, step: AttackStep, context: AttackContext) -> None:
+        finding = self._matching_real_finding(step, context)
+        if finding:
+            severity = str(finding.get("severity") or "").upper()
+            step.priority = 10 if severity in {"CRITICAL", "HIGH"} else 8
+            step.context_reason = f"Prioritized because PhantomScan has a real {severity or 'verified'} finding for {finding.get('title', step.attack)}."
+            return
+        reasons = []
+        if "parameters" in step.requires:
+            reasons.append(f"{len(context.parameters)} input parameter(s) discovered")
+        if "api" in step.requires:
+            reasons.append(f"{len(context.api_endpoints)} API endpoint(s) discovered")
+        if "graphql" in step.requires:
+            reasons.append("GraphQL endpoint or technology detected")
+        if "file_upload" in step.requires:
+            reasons.append("file upload entry point detected")
+        if "auth" in step.requires:
+            reasons.append("authentication entry point detected")
+        if "redirect" in step.requires:
+            reasons.append("redirect-like parameter detected")
+        if "cors_headers" in step.requires:
+            reasons.append("CORS headers observed")
+        if "debug_endpoint" in step.requires:
+            reasons.append("debug-style endpoint discovered")
+        step.context_reason = "; ".join(reasons) if reasons else "General low-noise reconnaissance step applicable to public web targets."
+
+    @staticmethod
+    def _step_rank(step: AttackStep) -> tuple[int, int, int, int]:
+        likelihood_score = {"VERY_HIGH": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "VERY_LOW": 1}
+        impact_score = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+        finding_specific = 1 if step.attack.lower().startswith(("exploit:", "validate finding:")) else 0
+        return (step.priority, finding_specific, impact_score.get(step.impact, 0), likelihood_score.get(step.likelihood, 0))
+
+    def _matching_real_finding(self, step: AttackStep, context: AttackContext) -> dict[str, Any] | None:
+        step_type = step.vulnerability_type.lower()
+        if not step_type:
+            return None
+        aliases = {
+            "injection": {"injection", "sqli", "sql injection"},
+            "xss": {"xss", "cross-site scripting"},
+            "api": {"api", "api_security"},
+            "security_headers": {"security_headers", "security headers", "csp", "x-frame-options", "hsts"},
+            "hsts": {"hsts", "strict-transport-security"},
+            "tls": {"tls", "https"},
+            "cors": {"cors"},
+            "file_upload": {"file upload", "file_upload", "upload"},
+            "jwt": {"jwt"},
+            "csrf": {"csrf"},
+        }
+        needles = aliases.get(step_type, {step_type})
+        for finding in context.real_findings:
+            text = " ".join(str(finding.get(name) or "") for name in ("title", "category", "module", "evidence")).lower()
+            if any(needle in text for needle in needles):
+                return finding
+        return None
+
+    def _dedupe_real_findings(self, findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: dict[str, dict[str, Any]] = {}
+        for finding in findings:
+            if self._is_false_positive_finding(finding):
+                continue
+            host = urlparse(str(finding.get("endpoint") or finding.get("target") or "")).netloc.lower()
+            key = f"{self._finding_type(finding)}|{host}"
+            current = deduped.get(key)
+            if current is None or self._finding_rank(finding) > self._finding_rank(current):
+                deduped[key] = finding
+        return list(deduped.values())
+
+    @staticmethod
+    def _is_false_positive_finding(finding: dict[str, Any]) -> bool:
+        if str(finding.get("risk_status") or "ACTIVE").upper() == "FALSE_POSITIVE":
+            return True
+        finding_type = str(finding.get("type") or finding.get("category") or finding.get("module") or "").lower()
+        status = str(finding.get("status") or finding.get("state") or "").lower()
+        if finding_type in {"hsts", "strict-transport-security"} and status in {"present", "enabled", "valid", "ok"}:
+            return True
+        if finding_type in {"tls", "https"} and status in {"supported", "valid", "ok"}:
+            return True
+        text = " ".join(str(finding.get(name) or "") for name in ("title", "category", "evidence", "request_response_diff", "verification_result")).lower()
+        if ("hsts" in text or "strict-transport-security" in text) and re.search(r"hsts (enabled|present|valid)|strict-transport-security: max-age=[1-9]", text):
+            return True
+        if "tls" in text and re.search(r"tls (1\.2|1\.3).*(works|ok|succeeded|supported)", text):
+            return True
+        return False
+
+    @staticmethod
+    def _finding_type(finding: dict[str, Any]) -> str:
+        text = " ".join(str(finding.get(name) or "") for name in ("title", "category", "module")).lower()
+        for key, patterns in {
+            "injection": ["sql", "injection"],
+            "xss": ["xss", "cross-site"],
+            "ssrf": ["ssrf"],
+            "graphql": ["graphql"],
+            "security_headers": ["security header", "hsts", "content-security-policy", "x-frame-options"],
+            "tls": ["tls", "https"],
+        }.items():
+            if any(pattern in text for pattern in patterns):
+                return key
+        return text[:80]
+
+    @staticmethod
+    def _finding_rank(finding: dict[str, Any]) -> tuple[int, float]:
+        severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+        severity = severity_rank.get(str(finding.get("severity") or "INFO").upper(), 0)
+        try:
+            confidence = float(finding.get("confidence_score") or 0)
+        except (TypeError, ValueError):
+            confidence = {"HIGH": 0.9, "MEDIUM": 0.6, "LOW": 0.3, "POTENTIAL": 0.2}.get(str(finding.get("confidence") or "LOW").upper(), 0.1)
+        return (severity, confidence)
+
+    @staticmethod
+    def _infer_requires(attack_def: dict[str, Any]) -> list[str]:
+        text = " ".join(str(value) for value in [attack_def.get("attack"), attack_def.get("description"), " ".join(attack_def.get("modules", [])), " ".join(attack_def.get("prerequisites", []))]).lower()
+        requirements: list[str] = []
+        if re.search(r"sql|xss|template|ssti|input parameter|user input", text):
+            requirements.append("parameters")
+        if "sql" in text:
+            requirements.append("database")
+        if "ssrf" in text or "metadata" in text or "fetch functionality" in text:
+            requirements.extend(["parameters", "server_side"])
+        if "redirect" in text:
+            requirements.append("redirect")
+        if "cors" in text:
+            requirements.append("cors_headers")
+        if re.search(r"debug|actuator|environment variable", text):
+            requirements.append("debug_endpoint")
+        if "upload" in text:
+            requirements.append("file_upload")
+        if "graphql" in text:
+            requirements.append("graphql")
+        if "api" in text or "idor" in text or "jwt" in text:
+            requirements.append("api")
+        if re.search(r"login|credential|password|auth|csrf|rate limiting", text):
+            requirements.append("auth")
+        if "form" in text or "csrf" in text:
+            requirements.append("forms")
+        if "cloud metadata" in text:
+            requirements.append("cloud")
+        return list(dict.fromkeys(requirements))
+
+    @staticmethod
+    def _infer_vulnerability_type(attack_def: dict[str, Any]) -> str:
+        text = " ".join(str(value) for value in [attack_def.get("attack"), attack_def.get("description"), " ".join(attack_def.get("modules", []))]).lower()
+        mapping = [
+            ("graphql", "graphql"),
+            ("xss", "xss"),
+            ("cross-site", "xss"),
+            ("sql", "injection"),
+            ("injection", "injection"),
+            ("ssrf", "ssrf"),
+            ("upload", "file_upload"),
+            ("redirect", "redirect"),
+            ("cors", "cors"),
+            ("jwt", "jwt"),
+            ("csrf", "csrf"),
+            ("api", "api"),
+            ("tls", "tls"),
+            ("hsts", "hsts"),
+            ("header", "security_headers"),
+        ]
+        for needle, value in mapping:
+            if needle in text:
+                return value
+        return ""
+
+    @staticmethod
+    def _infer_category(attack_def: dict[str, Any]) -> str:
+        modules = [str(module) for module in attack_def.get("modules", [])]
+        if modules:
+            return modules[0]
+        phase = attack_def.get("phase")
+        return phase.value if hasattr(phase, "value") else str(phase or "general")
 
     def _port_based_attacks(
         self, open_ports: list[int], target_url: str, host: str
@@ -1159,7 +1537,7 @@ class AttackPlanner:
     # ------------------------------------------------------------------
     # Summary and chain
     # ------------------------------------------------------------------
-    def _build_summary(self, steps: list[AttackStep], stack: TechStack) -> dict[str, Any]:
+    def _build_summary(self, steps: list[AttackStep], stack: TechStack, context: AttackContext) -> dict[str, Any]:
         phase_counts: dict[str, int] = {}
         likelihood_counts: dict[str, int] = {}
         impact_counts: dict[str, int] = {}
@@ -1189,6 +1567,16 @@ class AttackPlanner:
                 "databases": stack.databases,
                 "cloud": stack.cloud,
                 "cdn": stack.cdn,
+            },
+            "context": {
+                "parameters": context.parameters[:20],
+                "forms": len(context.forms),
+                "api_endpoints": context.api_endpoints[:20],
+                "graphql_endpoints": context.graphql_endpoints[:20],
+                "file_uploads": context.file_uploads[:20],
+                "auth_endpoints": context.auth_endpoints[:20],
+                "debug_endpoints": context.debug_endpoints[:20],
+                "real_findings": len(context.real_findings),
             },
         }
 
@@ -1224,4 +1612,9 @@ class AttackPlanner:
             "prerequisites": step.prerequisites,
             "mitigations": step.mitigations,
             "references": step.references,
+            "requires": step.requires,
+            "vulnerability_type": step.vulnerability_type,
+            "category": step.category,
+            "priority": step.priority,
+            "context_reason": step.context_reason,
         }

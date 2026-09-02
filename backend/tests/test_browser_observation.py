@@ -1,10 +1,7 @@
 import os
-import tempfile
 from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import AsyncMock, patch
 
-_db_fd, _db_path = tempfile.mkstemp(suffix=".browser.sqlite3")
-os.close(_db_fd)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 os.environ.setdefault("MAX_TOTAL_REQUESTS", "80")
 os.environ.setdefault("MAX_REQUESTS_PER_SECOND", "100")
 
@@ -16,6 +13,7 @@ from app.database import create_finding, create_scan, get_finding, get_scan_arti
 from app.lab import set_scenario_state
 from app.services.active_security import SecurityTestPlanner
 from app.services.browser_observation import (
+    BrowserSession,
     BrowserObservationEngine,
     ClientDataFlowAnalyzer,
     DOMSecurityAgent,
@@ -124,6 +122,33 @@ class BrowserObservationTests(IsolatedAsyncioTestCase):
         )
         result = await engine.run()
         self.assertEqual(result["status"], "cancelled")
+
+    async def test_windows_uses_http_fallback_without_starting_playwright(self) -> None:
+        scan_id = await make_scan()
+        engine = BrowserObservationEngine(
+            target_url="http://localhost/lab/phantombank",
+            mode="defend",
+            authorization_context={"authorization_status": "TRAINING"},
+            limits=limits(),
+            scan_id=scan_id,
+            use_playwright=True,
+        )
+        fallback_session = BrowserSession(
+            target="http://localhost/lab/phantombank",
+            mode="defend",
+            authorization={"authorization_status": "TRAINING"},
+            browser_context="test-session",
+        )
+        fallback = engine.empty_result(fallback_session, "complete", "")
+        engine.run_http_observation = AsyncMock(return_value=fallback)  # type: ignore[method-assign]
+        engine.run_playwright = AsyncMock(side_effect=AssertionError("Playwright should not start on Windows"))  # type: ignore[method-assign]
+
+        with patch("app.services.browser_observation.sys.platform", "win32"):
+            result = await engine.run()
+
+        self.assertEqual(result["browser_engine"], "http_fallback")
+        engine.run_http_observation.assert_awaited_once()
+        engine.run_playwright.assert_not_awaited()
 
     async def test_browser_artifact_persistence(self) -> None:
         scan_id = await make_scan()

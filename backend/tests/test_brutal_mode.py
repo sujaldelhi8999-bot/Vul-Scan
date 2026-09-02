@@ -13,14 +13,9 @@ Run:  python -m pytest tests/test_brutal_mode.py -v
 import asyncio
 import io
 import os
-import tempfile
 import zipfile
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
-
-_db_fd, _db_path = tempfile.mkstemp(suffix=".sqlite3")
-os.close(_db_fd)
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_db_path}")
 
 from app.agents.ai_payload import AIPayloadGenerator  # noqa: E402
 from app.agents.brutal_exploit import ExploitationEngine, SUPPORTED_CATEGORIES  # noqa: E402
